@@ -47,15 +47,19 @@ from obol.gui.dialogs import (
     NewProjectWizardDialog,
     ProjectAndVaultManagerDialog,
     PublishDeliverableDialog,
+    SaveSeedTemplateDialog,
     SmartIngestDialog,
     SoftwareSettingsDialog,
     TemplateManagerDialog,
 )
 from obol.gui.drop_widgets import DropTreeWidget, install_tab_hover_switch
+from obol.gui.filmcraft_dialogs import FilmCraftExportPublishDialog, FilmCraftImportDialog
 from obol.gui.integrations_dialog import IntegrationsManagerDialog
-from obol.gui.reaper_dialogs import ReaperExportPublishDialog
+from obol.gui.reaper_dialogs import ReaperExportPublishDialog, ReaperImportDialog
 from obol.gui.resolve_dialogs import ResolveExportPublishDialog
 from obol.gui.theme import apply_studio_dark_theme
+from obol.plugins.filmcraft_bridge import FilmCraftBridgeClient
+from obol.plugins.filmcraft_installer import FilmCraftInstaller
 from obol.plugins.integrations import DCCIntegrationManager
 from obol.plugins.reaper_bridge import ReaperBridgeClient
 from obol.plugins.reaper_installer import ReaperInstaller
@@ -113,6 +117,8 @@ class ObolMainWindow(QMainWindow):
             allow_studio_api=allow_studio,
         )
         self.resolve_installer = ResolveInstaller(self.hub)
+        self.filmcraft_bridge = FilmCraftBridgeClient(self.hub)
+        self.filmcraft_installer = FilmCraftInstaller(self.hub)
         self.integration_manager = DCCIntegrationManager(self.hub, allow_resolve_studio_api=allow_studio)
 
         self.active_project_name: str = initial_project or self.hub.config.last_active_project
@@ -194,7 +200,9 @@ class ObolMainWindow(QMainWindow):
         settings_btn.setToolTip("Configure 3-Tier Templates, Software Profiles, and Client Workspace Root")
         settings_menu = QMenu(settings_btn)
         act_tpl = settings_menu.addAction("3-Tier Templates...")
-        act_tpl.triggered.connect(self.open_template_manager_dialog)
+        act_tpl.triggered.connect(lambda: self.open_template_manager_dialog(initial_tab=0))
+        act_seeds = settings_menu.addAction("Software Seed Templates...")
+        act_seeds.triggered.connect(lambda: self.open_template_manager_dialog(initial_tab=2))
         act_sw = settings_menu.addAction("Software Profiles...")
         act_sw.triggered.connect(self.open_software_settings_dialog)
         act_dcc = settings_menu.addAction("DCC Integrations...")
@@ -459,9 +467,14 @@ class ObolMainWindow(QMainWindow):
         self.resolve_export_btn.setObjectName("PrimaryButton")
         self.resolve_export_btn.setToolTip("Render or export from DaVinci Resolve and auto-publish")
         self.resolve_export_btn.clicked.connect(self._action_export_from_resolve)
+        self.filmcraft_export_btn = QPushButton("Export from FilmCraft...")
+        self.filmcraft_export_btn.setObjectName("PrimaryButton")
+        self.filmcraft_export_btn.setToolTip("Export media, stills, or interchange from FilmCraft and auto-publish")
+        self.filmcraft_export_btn.clicked.connect(self._action_export_from_filmcraft)
         pr_top.addWidget(self.pub_ver_header, 1)
         pr_top.addWidget(self.reaper_export_btn)
         pr_top.addWidget(self.resolve_export_btn)
+        pr_top.addWidget(self.filmcraft_export_btn)
         pr_top.addWidget(export_dir_btn)
         pr_top.addWidget(sync_pub_btn)
         pr_layout.addLayout(pr_top)
@@ -583,6 +596,13 @@ class ObolMainWindow(QMainWindow):
         self.launch_btn.clicked.connect(self._action_primary_open)
         p3_layout.addWidget(self.launch_btn)
 
+        self.reaper_inc_save_btn = QPushButton("Increment Save (→ v002)")
+        self.reaper_inc_save_btn.setToolTip(
+            "Use REAPER Save As to save directly to the next working version while keeping it open for continued editing (Ctrl+Shift+S)"
+        )
+        self.reaper_inc_save_btn.clicked.connect(self._action_reaper_increment_save)
+        p3_layout.addWidget(self.reaper_inc_save_btn)
+
         self.vup_launch_btn = QPushButton("Version Up + Open")
         self.vup_launch_btn.clicked.connect(self._action_vup_and_launch)
         p3_layout.addWidget(self.vup_launch_btn)
@@ -594,6 +614,13 @@ class ObolMainWindow(QMainWindow):
         self.collect_media_btn = QPushButton("Scan && Collect External .rpp Media")
         self.collect_media_btn.clicked.connect(self._action_collect_external_media)
         p3_layout.addWidget(self.collect_media_btn)
+
+        self.reaper_update_media_btn = QPushButton("Update REAPER Media / MIDI...")
+        self.reaper_update_media_btn.setToolTip(
+            "Scan the open REAPER session (or active .rpp) for newer Obol MIDI & media versions"
+        )
+        self.reaper_update_media_btn.clicked.connect(self._action_open_reaper_update_dialog)
+        p3_layout.addWidget(self.reaper_update_media_btn)
 
         folder_row = QHBoxLayout()
         self.open_explorer_btn = QPushButton("Open Folder")
@@ -668,6 +695,11 @@ class ObolMainWindow(QMainWindow):
         self.resolve_status_pill.setToolTip("DaVinci Resolve Bridge status — click to install or configure")
         self.resolve_status_pill.clicked.connect(self.open_resolve_integration_dialog)
 
+        self.filmcraft_status_pill = QPushButton("FilmCraft: Offline")
+        self.filmcraft_status_pill.setObjectName("StatusPillLocal")
+        self.filmcraft_status_pill.setToolTip("FilmCraft Control Bridge status — click to configure")
+        self.filmcraft_status_pill.clicked.connect(self.open_filmcraft_integration_dialog)
+
         self.vault_status_pill = QPushButton("Standalone Local")
         self.vault_status_pill.setObjectName("StatusPillLocal")
         self.vault_status_pill.setToolTip("Click to manage Projects & Server Vault")
@@ -679,6 +711,7 @@ class ObolMainWindow(QMainWindow):
         sb_layout.addWidget(self.dcc_status_pill)
         sb_layout.addWidget(self.reaper_status_pill)
         sb_layout.addWidget(self.resolve_status_pill)
+        sb_layout.addWidget(self.filmcraft_status_pill)
         sb_layout.addWidget(self.vault_status_pill)
         root_layout.addWidget(status_bar)
 
@@ -746,6 +779,7 @@ class ObolMainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+N"), self, activated=self.open_new_project_wizard)
         QShortcut(QKeySequence("Ctrl+Shift+N"), self, activated=self._prompt_add_component)
         QShortcut(QKeySequence("Ctrl+U"), self, activated=self._action_version_up_working)
+        QShortcut(QKeySequence("Ctrl+Shift+S"), self, activated=self._action_reaper_increment_save)
         QShortcut(QKeySequence("Ctrl+I"), self, activated=self._action_context_ingest)
         QShortcut(QKeySequence("Ctrl+P"), self, activated=self._action_publish_deliverable)
         QShortcut(QKeySequence("Ctrl+S"), self, activated=self._save_inspector_metadata)
@@ -798,6 +832,17 @@ class ObolMainWindow(QMainWindow):
             self.resolve_status_pill.setObjectName("StatusPillLocal")
             self.resolve_status_pill.setVisible(False)
         _repolish(self.resolve_status_pill)
+
+        fst = self.filmcraft_bridge.get_state(query_live=False)
+        if fst.connected:
+            self.filmcraft_status_pill.setText(f"FilmCraft: Live (:{fst.control_port})")
+            self.filmcraft_status_pill.setObjectName("StatusPillOnline")
+            self.filmcraft_status_pill.setVisible(True)
+        else:
+            self.filmcraft_status_pill.setText("FilmCraft: Offline")
+            self.filmcraft_status_pill.setObjectName("StatusPillLocal")
+            self.filmcraft_status_pill.setVisible(False)
+        _repolish(self.filmcraft_status_pill)
 
         reports = self.integration_manager.list_reports()
         live_names = [r.display_name.split()[0] for r in reports if r.bridge_connected]
@@ -1055,9 +1100,7 @@ class ObolMainWindow(QMainWindow):
             self.insp_software_combo.setCurrentText(snap.software)
         self.insp_software_combo.blockSignals(False)
         self._update_software_exe_hint(snap.software)
-        self.collect_media_btn.setVisible(snap.software == "reaper")
-        self.reaper_export_btn.setVisible(snap.software == "reaper")
-        self.resolve_export_btn.setVisible(snap.software == "resolve")
+        self._sync_software_action_visibility(snap.software)
 
         # Populate Working tab (multi-column)
         prev_working_ver = self._selected_working_version()
@@ -1293,17 +1336,24 @@ class ObolMainWindow(QMainWindow):
             self.insp_comment_edit.clear()
             self.save_meta_btn.setEnabled(False)
             self.launch_btn.setEnabled(False)
+            self.reaper_inc_save_btn.setVisible(False)
+            self.reaper_inc_save_btn.setEnabled(False)
             self.vup_launch_btn.setEnabled(False)
             self.pub_from_working_btn.setEnabled(False)
             self.open_explorer_btn.setEnabled(False)
             self.copy_path_btn.setEnabled(False)
             self.delete_selected_btn.setEnabled(False)
+            self.collect_media_btn.setVisible(False)
+            self.reaper_update_media_btn.setVisible(False)
             self.reaper_export_btn.setVisible(False)
             self.resolve_export_btn.setVisible(False)
+            self.filmcraft_export_btn.setVisible(False)
             return
 
         prof = self.hub.get_software_profile(snap.software)
         latest_w = max((w.version for w in snap.working_versions), default=0)
+        self.reaper_inc_save_btn.setEnabled(snap.software == "reaper")
+        self.reaper_inc_save_btn.setText(f"Increment Save (→ v{latest_w + 1:03d})")
         self.vup_launch_btn.setEnabled(True)
         self.vup_launch_btn.setText(f"Version Up (→ v{latest_w + 1:03d}) + Open")
         self.open_explorer_btn.setEnabled(True)
@@ -1457,6 +1507,18 @@ class ObolMainWindow(QMainWindow):
         else:
             self.sw_exe_hint_label.setText("ℹ Uses OS default app (configure .exe in ⚙ Settings → Software)")
 
+    def _sync_software_action_visibility(self, sw_key: str) -> None:
+        self.collect_media_btn.setVisible(sw_key in ("reaper", "filmcraft"))
+        if sw_key == "filmcraft":
+            self.collect_media_btn.setText("Scan && Collect External .fcproj Media")
+        else:
+            self.collect_media_btn.setText("Scan && Collect External .rpp Media")
+        self.reaper_inc_save_btn.setVisible(sw_key == "reaper")
+        self.reaper_update_media_btn.setVisible(sw_key == "reaper")
+        self.reaper_export_btn.setVisible(sw_key == "reaper")
+        self.resolve_export_btn.setVisible(sw_key == "resolve")
+        self.filmcraft_export_btn.setVisible(sw_key == "filmcraft")
+
     def _on_component_software_changed(self, _idx: int) -> None:
         if not self.active_project_root or not self.active_snapshot:
             return
@@ -1466,9 +1528,7 @@ class ObolMainWindow(QMainWindow):
         self.active_snapshot.software = sw_key
         save_component_snapshot(self.active_project_root, self.active_snapshot)
         self._update_software_exe_hint(sw_key)
-        self.collect_media_btn.setVisible(sw_key == "reaper")
-        self.reaper_export_btn.setVisible(sw_key == "reaper")
-        self.resolve_export_btn.setVisible(sw_key == "resolve")
+        self._sync_software_action_visibility(sw_key)
 
         # Update software badge in component_tree immediately
         def _update_tree_item(item: QTreeWidgetItem) -> bool:
@@ -1547,16 +1607,23 @@ class ObolMainWindow(QMainWindow):
         if not self.active_project_root:
             return
         initial_prefix = prefix_override if prefix_override is not None else self._selected_group_prefix
-        dlg = AddComponentDialog(self, self.hub, initial_prefix=initial_prefix)
+        dlg = AddComponentDialog(
+            self,
+            self.hub,
+            initial_prefix=initial_prefix,
+            project_root=self.active_project_root,
+        )
         if dlg.exec() == AddComponentDialog.DialogCode.Accepted:
             vals = dlg.get_values()
             cpath = str(vals["component_path"])
+            seed_override = vals.get("seed_override")
             self.workspace.create_component(
                 project_root=self.active_project_root,
                 component_path=cpath,
                 task_template=str(vals["task_template"]),
                 software_override=str(vals["software_override"]),
                 seed_initial_working=bool(vals["seed_initial_working"]),
+                seed_override=str(seed_override) if seed_override else None,
             )
             self.active_component_path = cpath
             self._load_active_project()
@@ -1998,6 +2065,25 @@ class ObolMainWindow(QMainWindow):
         ver = version if version is not None else self._selected_working_version()
         if (
             self.active_snapshot
+            and self.active_snapshot.software == "filmcraft"
+        ):
+            bundle = (
+                next((v for v in self.active_snapshot.working_versions if v.version == ver), None)
+                if ver is not None
+                else (self.active_snapshot.working_versions[-1] if self.active_snapshot.working_versions else None)
+            )
+            if bundle and bundle.primary_file:
+                target = self.active_project_root / self.active_component_path / bundle.primary_file
+                if target.is_file():
+                    try:
+                        res = self.filmcraft_bridge.open_project(target)
+                        mode_msg = "in running FilmCraft" if res.get("mode") == "live_bridge" else "in FilmCraft (--control)"
+                        self.show_status_message(f"✓ Opened {bundle.version_label} {mode_msg}")
+                        return
+                    except Exception:
+                        pass
+        if (
+            self.active_snapshot
             and self.active_snapshot.software == "reaper"
             and self.reaper_bridge.is_connected()
         ):
@@ -2081,11 +2167,126 @@ class ObolMainWindow(QMainWindow):
                 "or drag the file directly from this list into REAPER's Arrange view.",
             )
             return
+        metas: list[dict[str, Any]] = []
+        for p in existing:
+            meta = (
+                self.workspace.describe_asset_file(self.active_project_root, p)
+                if self.active_project_root
+                else None
+            )
+            if meta is None:
+                meta = {
+                    "file_path": str(p.resolve()),
+                    "file_name": p.name,
+                    "media_kind": "midi" if p.suffix.lower() in (".mid", ".midi") else "media",
+                }
+            metas.append(meta)
         try:
-            res = self.reaper_bridge.insert_media(existing, mode=mode)
+            res = self.reaper_bridge.insert_media(
+                existing,
+                mode=mode,
+                asset_meta=(metas[0] if len(metas) == 1 else {}),
+                asset_metas=metas,
+            )
             self.show_status_message(f"✓ Imported {res.get('inserted', len(existing))} file(s) into REAPER")
         except Exception as exc:
             QMessageBox.warning(self, "Import into REAPER", str(exc))
+
+    def _action_open_reaper_update_dialog(self) -> None:
+        active_rpp = self.reaper_bridge.get_state().active_rpp
+        if not active_rpp and self.active_project_root and self.active_component_path and self.active_snapshot:
+            ver = self._selected_working_version()
+            bundle = (
+                next((v for v in self.active_snapshot.working_versions if v.version == ver), None)
+                if ver is not None
+                else (self.active_snapshot.working_versions[-1] if self.active_snapshot.working_versions else None)
+            )
+            if bundle and bundle.primary_file:
+                cand = (self.active_project_root / self.active_component_path / bundle.primary_file).resolve()
+                if cand.is_file():
+                    active_rpp = str(cand)
+        dlg = ReaperImportDialog(
+            self,
+            self.hub,
+            self.workspace,
+            self.reaper_bridge,
+            active_rpp=active_rpp,
+            initial_tab=1,
+        )
+        dlg.exec()
+
+    def _action_update_asset_in_reaper(
+        self,
+        target_path: Path,
+        update_mode: str = "replace_source",
+        silent: bool = False,
+    ) -> dict[str, Any]:
+        if not target_path.is_file() or not self.active_project_root:
+            if not silent:
+                QMessageBox.warning(self, "Update in REAPER", "Target file is not available locally on disk.")
+            return {"updated_takes": 0, "updated_items": 0}
+
+        target_meta = self.workspace.describe_asset_file(self.active_project_root, target_path)
+        if target_meta is None:
+            if not silent:
+                QMessageBox.warning(self, "Update in REAPER", "Could not resolve target file to an Obol repo/ or published/ asset.")
+            return {"updated_takes": 0, "updated_items": 0}
+
+        if not self.reaper_bridge.is_connected():
+            if not silent:
+                QMessageBox.information(
+                    self,
+                    "REAPER Bridge Offline",
+                    "REAPER Bridge is not currently running.\n\n"
+                    "Open REAPER (with Obol Bridge running) to update imported MIDI or media takes.",
+                )
+            return {"updated_takes": 0, "updated_items": 0}
+
+        try:
+            session_items = self.reaper_bridge.query_session_media()
+            take_updates: list[dict[str, Any]] = []
+            replacements: dict[str, str] = {}
+            target_key = (target_meta["component"], target_meta["scope"], target_meta["asset_key"])
+            for sit in session_items:
+                resolved = self.workspace.resolve_reaper_session_item(self.active_project_root, sit)
+                if resolved is None:
+                    continue
+                if (resolved["component"], resolved["kind"], resolved["asset_key"]) != target_key:
+                    continue
+                curr_file = Path(str(resolved["current_file"]))
+                replacements[str(curr_file)] = str(target_path.resolve())
+                take_updates.append({
+                    "take_guid": str(resolved.get("take_guid") or ""),
+                    "item_guid": str(resolved.get("item_guid") or ""),
+                    "old_path": str(curr_file),
+                    "target_path": str(target_path.resolve()),
+                    "asset_meta": target_meta,
+                })
+
+            if not take_updates:
+                if not silent:
+                    QMessageBox.information(
+                        self,
+                        "Update in REAPER",
+                        f"No takes matching '{target_meta['component']} / {target_meta['asset_key']}' were found in the active REAPER session.",
+                    )
+                return {"updated_takes": 0, "updated_items": 0}
+
+            res = self.reaper_bridge.update_media_sources(
+                replacements=replacements,
+                take_updates=take_updates,
+                update_mode=update_mode,
+                midi_mode="preserve",
+                match_length="auto",
+            )
+            self.show_status_message(
+                f"✓ Updated {res.get('updated_takes', 0)} take(s) in REAPER to v{int(target_meta['version']):03d}"
+            )
+            return res
+        except Exception as exc:
+            if not silent:
+                QMessageBox.warning(self, "Update in REAPER", str(exc))
+            return {"updated_takes": 0, "updated_items": 0}
 
     def _action_export_from_reaper(self) -> None:
         if not self.active_project_root or not self.active_component_path:
@@ -2144,6 +2345,133 @@ class ObolMainWindow(QMainWindow):
             self._refresh_component_triad()
             self.show_status_message("✓ Exported & published from DaVinci Resolve")
 
+    def _list_project_filmcraft_files(self) -> list[tuple[str, Path]]:
+        if not self.active_project_root or not self.active_project_root.is_dir():
+            return []
+        found: list[tuple[str, Path]] = []
+        for comp in discover_project_components(self.active_project_root):
+            snap = load_component_snapshot(self.active_project_root, comp)
+            if not snap.working_versions:
+                continue
+            latest = snap.working_versions[-1]
+            if not latest.primary_file:
+                continue
+            p = (self.active_project_root / comp / latest.primary_file).resolve()
+            if (snap.software == "filmcraft" or p.suffix.lower() == ".fcproj") and p.is_file():
+                found.append((comp, p))
+        return found
+
+    def _active_working_fcproj(
+        self,
+        version: Optional[int] = None,
+        fallback_any_component: bool = False,
+    ) -> Optional[Path]:
+        if self.active_project_root and self.active_component_path and self.active_snapshot:
+            if self.active_snapshot.software == "filmcraft" and self.active_snapshot.working_versions:
+                ver = version if version is not None else self._selected_working_version()
+                bundle = (
+                    next((v for v in self.active_snapshot.working_versions if v.version == ver), None)
+                    if ver is not None
+                    else self.active_snapshot.working_versions[-1]
+                )
+                if bundle and bundle.primary_file:
+                    p = (self.active_project_root / self.active_component_path / bundle.primary_file).resolve()
+                    if p.suffix.lower() == ".fcproj" and p.is_file():
+                        return p
+        if fallback_any_component:
+            candidates = self._list_project_filmcraft_files()
+            if len(candidates) == 1:
+                return candidates[0][1]
+        return None
+
+    def _action_import_files_into_filmcraft(
+        self,
+        paths: list[Path],
+        place_on_timeline: bool = False,
+    ) -> None:
+        existing = [p for p in paths if p.is_file()]
+        if not existing:
+            QMessageBox.warning(self, "Import into FilmCraft", "Target file(s) are not available locally on disk.")
+            return
+        live = self.filmcraft_bridge.is_live_bridge_listening()
+        fcproj = None if live else self._active_working_fcproj()
+        if not live and fcproj is None:
+            candidates = self._list_project_filmcraft_files()
+            if len(candidates) == 1:
+                fcproj = candidates[0][1]
+            elif len(candidates) > 1:
+                labels = [f"{comp} ({p.name})" for comp, p in candidates]
+                chosen, ok = QInputDialog.getItem(
+                    self,
+                    "Select Target FilmCraft Project",
+                    "FilmCraft live bridge is offline. Select which component's .fcproj to import into:",
+                    labels,
+                    0,
+                    False,
+                )
+                if not ok or not chosen:
+                    return
+                fcproj = candidates[labels.index(chosen)][1]
+        if not live and fcproj is None:
+            QMessageBox.information(
+                self,
+                "FilmCraft Target Needed",
+                "No live FilmCraft --control session or FilmCraft working .fcproj was found in this project.\n\n"
+                "Open a FilmCraft working version from Obol or create a FilmCraft component first.",
+            )
+            return
+        try:
+            bin_path = f"Obol/{self.active_component_path}" if self.active_component_path else ""
+            res = self.filmcraft_bridge.import_media(
+                existing,
+                bin_path=bin_path,
+                place_on_timeline=place_on_timeline,
+                project_path=fcproj,
+                use_bridge=live,
+            )
+            count = res.get("imported", len(existing))
+            if live:
+                self.show_status_message(f"✓ Imported {count} file(s) into live FilmCraft")
+            else:
+                assert fcproj is not None
+                self.show_status_message(
+                    f"✓ Imported {count} file(s) into {fcproj.name} (headless — reopen in FilmCraft or open via Obol for live bridge)"
+                )
+        except Exception as exc:
+            QMessageBox.warning(self, "Import into FilmCraft", str(exc))
+
+    def _action_import_dialog_filmcraft(self, version: Optional[int] = None) -> None:
+        if not self.active_project_root or not self.active_component_path:
+            return
+        fcproj = self._active_working_fcproj(version=version)
+        dlg = FilmCraftImportDialog(
+            self,
+            self.hub,
+            self.workspace,
+            self.filmcraft_bridge,
+            active_fcproj=str(fcproj) if fcproj else "",
+            default_project=self.active_project_name,
+            default_component=self.active_component_path,
+        )
+        dlg.exec()
+
+    def _action_export_from_filmcraft(self, version: Optional[int] = None) -> None:
+        if not self.active_project_root or not self.active_component_path:
+            return
+        fcproj = self._active_working_fcproj(version=version)
+        dlg = FilmCraftExportPublishDialog(
+            self,
+            self.hub,
+            self.workspace,
+            self.filmcraft_bridge,
+            active_fcproj=str(fcproj) if fcproj else "",
+            default_project=self.active_project_name,
+            default_component=self.active_component_path,
+        )
+        if dlg.exec() == FilmCraftExportPublishDialog.DialogCode.Accepted:
+            self._refresh_component_triad()
+            self.show_status_message("✓ Exported & published from FilmCraft")
+
     def _on_working_item_double_clicked(self, item: QTreeWidgetItem, _col: int) -> None:
         raw = item.data(0, Qt.ItemDataRole.UserRole)
         if raw is not None:
@@ -2184,25 +2512,94 @@ class ObolMainWindow(QMainWindow):
         self._action_launch_working(bundle.version)
         self.show_status_message(f"✓ Created & launched working/{bundle.version_label}")
 
+    def _action_reaper_increment_save(
+        self,
+        comment: str = "",
+        silent: bool = False,
+    ) -> Optional[VersionBundle]:
+        if not self.reaper_bridge.is_connected():
+            if not silent:
+                QMessageBox.information(
+                    self,
+                    "REAPER Bridge Offline",
+                    "REAPER Bridge is not currently running.\n\n"
+                    "Start REAPER (with Obol Bridge enabled) to increment-save the active session directly.",
+                )
+            return None
+
+        st = self.reaper_bridge.get_state()
+        rpp_ctx = self.workspace.resolve_working_file_context(Path(st.active_rpp)) if st.active_rpp else None
+        if rpp_ctx is not None:
+            target_proot = rpp_ctx.project_root
+            target_comp = rpp_ctx.component_path
+            src_ver: Optional[int] = rpp_ctx.working_version
+        else:
+            target_proot = self.active_project_root
+            target_comp = self.active_component_path
+            src_ver = self._selected_working_version() if self.triad_tabs.currentIndex() == 0 else None
+
+        if not target_proot or not target_comp:
+            if not silent:
+                QMessageBox.warning(
+                    self,
+                    "Increment Save in REAPER",
+                    "Select an Obol component (or open a working .rpp inside an Obol project) first.",
+                )
+            return None
+
+        prep = self.workspace.prepare_next_working_version(
+            target_proot,
+            target_comp,
+            source_version=src_ver,
+            extension=".rpp",
+        )
+        target_rpp = Path(prep["primary_file"])
+        ver_dir = Path(prep["version_dir"])
+        try:
+            self.reaper_bridge.save_project_as(target_rpp, ensure_open=True)
+            if not target_rpp.is_file():
+                raise FileNotFoundError(f"REAPER did not write target file: {target_rpp}")
+        except Exception as exc:
+            if ver_dir.is_dir() and not any(ver_dir.iterdir()):
+                ver_dir.rmdir()
+            if not silent:
+                QMessageBox.warning(self, "Increment Save Failed", str(exc))
+            return None
+
+        bundle = self.workspace.register_saved_working_version(
+            target_proot,
+            target_comp,
+            version=int(prep["version"]),
+            primary_file=target_rpp,
+            parent_version=int(prep["parent_version"]),
+            comment=comment or f"Increment saved from REAPER ({prep['version_label']})",
+        )
+        self._refresh_component_triad()
+        self.show_status_message(f"✓ Increment saved REAPER session as {target_comp}/working/{bundle.version_label}")
+        return bundle
+
     def _action_collect_external_media(self) -> None:
         if not self.active_project_root or not self.active_component_path:
             return
         ver = self._selected_working_version() if self.triad_tabs.currentIndex() == 0 else None
+        sw = self.active_snapshot.software if self.active_snapshot else ""
+        dcc_lbl = "FilmCraft" if sw == "filmcraft" else "Reaper"
+        ext_lbl = ".fcproj" if sw == "filmcraft" else ".rpp"
         externals = self.workspace.scan_external_dependencies(
             self.active_project_root, self.active_component_path, working_version=ver
         )
         if not externals:
             QMessageBox.information(
                 self,
-                "Reaper Dependency Audit",
-                "All audio and MIDI files in the .rpp are already inside repo/!",
+                f"{dcc_lbl} Dependency Audit",
+                f"All media files in the {ext_lbl} are already inside repo/!",
             )
             return
         msg = "\n".join(f"• {d.raw_reference} → repo/{d.suggested_category}/{d.suggested_asset_name}/v001/" for d in externals)
         ans = QMessageBox.question(
             self,
             "Collect External Media into Repo",
-            f"Found {len(externals)} external reference(s) outside repo/:\n\n{msg}\n\nIngest all into repo/ and relink .rpp?",
+            f"Found {len(externals)} external reference(s) outside repo/:\n\n{msg}\n\nIngest all into repo/ and relink {ext_lbl}?",
         )
         if ans == QMessageBox.StandardButton.Yes:
             collected = self.workspace.collect_external_dependencies(
@@ -2325,16 +2722,19 @@ class ObolMainWindow(QMainWindow):
         src_abs = self.active_project_root / self.active_component_path / bundle.primary_file
         if not src_abs.is_file():
             return
-        default_name = f"{self.active_component_path.split('/')[-1]}_seed{src_abs.suffix}"
-        tpl_name, ok = QInputDialog.getText(
+        dlg = SaveSeedTemplateDialog(
             self,
-            "Save as Working Seed Template",
-            "Seed filename in ~/.obol/templates/files/:",
-            text=default_name,
+            self.hub,
+            source_file=src_abs,
+            software_key=self.active_snapshot.software,
+            project_root=self.active_project_root,
+            client_root=self.hub.get_client_root(),
+            default_comment=f"Captured from {self.active_component_path} v{ver:03d}",
         )
-        if ok and tpl_name.strip():
-            dest = self.hub.template_manager.import_seed_file(src_abs, tpl_name.strip())
-            self.show_status_message(f"✓ Saved seed template '{dest.name}'")
+        if dlg.exec() == SaveSeedTemplateDialog.DialogCode.Accepted and dlg.saved_stream and dlg.saved_version:
+            self.show_status_message(
+                f"✓ Saved seed '{dlg.saved_stream.name}' {dlg.saved_version.version_label} ({dlg.saved_scope.value})"
+            )
 
     def _capture_component_as_template(self, comp_path: str) -> None:
         if not self.active_project_root:
@@ -2407,6 +2807,9 @@ class ObolMainWindow(QMainWindow):
             if (self.active_snapshot and self.active_snapshot.software == "reaper")
             else None
         )
+        is_fc = bool(self.active_snapshot and self.active_snapshot.software == "filmcraft")
+        act_fc_imp = menu.addAction("Import Media into FilmCraft...") if is_fc else None
+        act_fc_pub = menu.addAction("Export && Publish from FilmCraft...") if is_fc else None
         act_vup = menu.addAction(f"Version Up from v{ver:03d}...")
         act_pub = menu.addAction(f"Publish from v{ver:03d}...")
         act_seed = menu.addAction("Save as Working Seed Template...")
@@ -2420,6 +2823,10 @@ class ObolMainWindow(QMainWindow):
             self._action_launch_working(ver)
         elif act_open_tab is not None and chosen == act_open_tab:
             self._action_launch_working(ver, new_tab=True)
+        elif act_fc_imp is not None and chosen == act_fc_imp:
+            self._action_import_dialog_filmcraft(version=ver)
+        elif act_fc_pub is not None and chosen == act_fc_pub:
+            self._action_export_from_filmcraft(version=ver)
         elif chosen == act_vup:
             self._action_version_up_working(source_version=ver)
         elif chosen == act_pub:
@@ -2467,8 +2874,12 @@ class ObolMainWindow(QMainWindow):
         act_open = menu.addAction(f"Open v{ver:03d} File")
         act_reap_new = menu.addAction("Import into REAPER (New Track)")
         act_reap_cur = menu.addAction("Import into REAPER (At Cursor)")
+        act_reap_take = menu.addAction("Import into REAPER (New Take)")
+        act_reap_upd = menu.addAction("Update Existing in REAPER Session")
         act_dvr_pool = menu.addAction("Load into Resolve Media Pool")
         act_dvr_tl = menu.addAction("Load into Resolve + Timeline")
+        act_fc_bin = menu.addAction("Import into FilmCraft (Project Bin)")
+        act_fc_tl = menu.addAction("Import into FilmCraft (+ Timeline)")
         act_new_v = menu.addAction("+ Ingest New Version...")
         act_exp = menu.addAction("Open Version Folder in Explorer")
         act_copy = menu.addAction("Copy File Path")
@@ -2481,10 +2892,18 @@ class ObolMainWindow(QMainWindow):
             self._action_import_files_into_reaper([target_path], mode="new_track")
         elif chosen == act_reap_cur and target_path:
             self._action_import_files_into_reaper([target_path], mode="cursor_track")
+        elif chosen == act_reap_take and target_path:
+            self._action_import_files_into_reaper([target_path], mode="new_take")
+        elif chosen == act_reap_upd and target_path:
+            self._action_update_asset_in_reaper(target_path)
         elif chosen == act_dvr_pool and target_path:
             self._action_load_files_into_resolve([target_path], append_to_timeline=False)
         elif chosen == act_dvr_tl and target_path:
             self._action_load_files_into_resolve([target_path], append_to_timeline=True)
+        elif chosen == act_fc_bin and target_path:
+            self._action_import_files_into_filmcraft([target_path], place_on_timeline=False)
+        elif chosen == act_fc_tl and target_path:
+            self._action_import_files_into_filmcraft([target_path], place_on_timeline=True)
         elif chosen == act_new_v:
             self._action_ingest_repo_version()
         elif chosen == act_exp:
@@ -2521,8 +2940,12 @@ class ObolMainWindow(QMainWindow):
         act_open = menu.addAction("Open File") if (isinstance(data, tuple) and data[0] == "file") else None
         act_reap_new = menu.addAction("Import into REAPER (New Track)") if target_path else None
         act_reap_cur = menu.addAction("Import into REAPER (At Cursor)") if target_path else None
+        act_reap_take = menu.addAction("Import into REAPER (New Take)") if target_path else None
+        act_reap_upd = menu.addAction("Update Existing in REAPER Session") if target_path else None
         act_dvr_pool = menu.addAction("Load into Resolve Media Pool") if target_path else None
         act_dvr_tl = menu.addAction("Load into Resolve + Timeline") if target_path else None
+        act_fc_bin = menu.addAction("Import into FilmCraft (Project Bin)") if target_path else None
+        act_fc_tl = menu.addAction("Import into FilmCraft (+ Timeline)") if target_path else None
         act_add = menu.addAction("+ Attach More Files to Release...")
         act_exp = menu.addAction("Open Release Folder in Explorer")
         act_copy = menu.addAction("Copy Path")
@@ -2535,10 +2958,18 @@ class ObolMainWindow(QMainWindow):
             self._action_import_files_into_reaper([target_path], mode="new_track")
         elif act_reap_cur is not None and chosen == act_reap_cur and target_path:
             self._action_import_files_into_reaper([target_path], mode="cursor_track")
+        elif act_reap_take is not None and chosen == act_reap_take and target_path:
+            self._action_import_files_into_reaper([target_path], mode="new_take")
+        elif act_reap_upd is not None and chosen == act_reap_upd and target_path:
+            self._action_update_asset_in_reaper(target_path)
         elif act_dvr_pool is not None and chosen == act_dvr_pool and target_path:
             self._action_load_files_into_resolve([target_path], append_to_timeline=False)
         elif act_dvr_tl is not None and chosen == act_dvr_tl and target_path:
             self._action_load_files_into_resolve([target_path], append_to_timeline=True)
+        elif act_fc_bin is not None and chosen == act_fc_bin and target_path:
+            self._action_import_files_into_filmcraft([target_path], place_on_timeline=False)
+        elif act_fc_tl is not None and chosen == act_fc_tl and target_path:
+            self._action_import_files_into_filmcraft([target_path], place_on_timeline=True)
         elif chosen == act_add and isinstance(data, tuple) and len(data) >= 3 and data[1] != "__legacy__":
             self._publish_flow([], default_deliverable=str(data[1]), default_target_version=int(data[2]))
         elif chosen == act_exp:
@@ -2719,12 +3150,16 @@ class ObolMainWindow(QMainWindow):
     def open_resolve_integration_dialog(self) -> None:
         self.open_integrations_manager_dialog(initial_dcc="resolve")
 
-    def open_template_manager_dialog(self) -> None:
+    def open_filmcraft_integration_dialog(self) -> None:
+        self.open_integrations_manager_dialog(initial_dcc="filmcraft")
+
+    def open_template_manager_dialog(self, initial_tab: int = 0) -> None:
         dlg = TemplateManagerDialog(
             self,
             self.hub,
             active_project_root=self.active_project_root,
             active_component_path=self.active_component_path,
+            initial_tab=initial_tab,
         )
         dlg.exec()
         self.refresh_all()

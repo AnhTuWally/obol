@@ -9,6 +9,7 @@ from pathlib import Path
 from obol.core.hub import ObolHub
 from obol.core.workspace import ObolWorkspace
 from obol.plugins.base import unlock_file_writable
+from obol.plugins.reaper import ReaperPlugin
 
 
 class TestReaperPlugin(unittest.TestCase):
@@ -67,6 +68,64 @@ class TestReaperPlugin(unittest.TestCase):
 
         # Re-scanning should now report 0 external dependencies
         self.assertEqual(len(self.ws.scan_external_dependencies(proj_root, "audio")), 0)
+
+    def test_offline_rpp_detects_and_updates_newer_midi_and_audio_versions(self) -> None:
+        proj_root = self.ws.init_project("reaper_upd_proj", self.root / "reaper_upd_proj")
+        v1_rpp = proj_root / "audio" / "working" / "v001" / "audio_v001.rpp"
+
+        kick1 = self.root / "kick1.wav"
+        kick2 = self.root / "kick2.wav"
+        kick1.write_bytes(b"WAV1")
+        kick2.write_bytes(b"WAV2")
+        _, k_b1 = self.ws.ingest_repo_asset(proj_root, "audio", kick1, asset_path="audio/kick")
+        _, k_b2 = self.ws.ingest_repo_asset(proj_root, "audio", kick2, asset_path="audio/kick")
+
+        mid1 = self.root / "lead1.mid"
+        mid2 = self.root / "lead2.mid"
+        mid1.write_bytes(b"MThd-1")
+        mid2.write_bytes(b"MThd-2")
+        _, m_b1 = self.ws.ingest_repo_asset(proj_root, "audio", mid1, asset_path="midi/lead_melody")
+        _, m_b2 = self.ws.ingest_repo_asset(proj_root, "audio", mid2, asset_path="midi/lead_melody")
+
+        unlock_file_writable(v1_rpp)
+        v1_rpp.write_text(
+            f"""<REAPER_PROJECT 0.1 "7.0"
+  RECORD_PATH "../../repo/recorded" ""
+  RENDER_FILE "../../published"
+  <TRACK
+    <ITEM
+      <SOURCE WAVE
+        FILE "../../{k_b1.primary_file}"
+      >
+    >
+  >
+  <TRACK
+    <ITEM
+      <SOURCE MIDI
+        FILE "../../{m_b1.primary_file}"
+      >
+    >
+  >
+>
+""",
+            encoding="utf-8",
+        )
+
+        refs = ReaperPlugin.find_outdated_rpp_references(v1_rpp, proj_root, self.ws)
+        self.assertEqual(len(refs), 2)
+        self.assertTrue(all(r["update_available"] for r in refs))
+        by_kind = {r["media_kind"]: r for r in refs}
+        self.assertEqual(by_kind["midi"]["latest_version"], 2)
+        self.assertEqual(by_kind["media"]["latest_version"], 2)
+
+        upd = ReaperPlugin.update_rpp_references(v1_rpp, proj_root, self.ws)
+        self.assertEqual(upd["updated_count"], 2)
+        text = v1_rpp.read_text(encoding="utf-8")
+        self.assertIn(f"../../{k_b2.primary_file}", text)
+        self.assertIn(f"../../{m_b2.primary_file}", text)
+
+        refs_after = ReaperPlugin.find_outdated_rpp_references(v1_rpp, proj_root, self.ws)
+        self.assertTrue(all(not r["update_available"] for r in refs_after))
 
 
 if __name__ == "__main__":

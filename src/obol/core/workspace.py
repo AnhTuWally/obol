@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+import json
 import os
 import re
 import shutil
@@ -43,8 +44,10 @@ from obol.plugins.base import (
     launch_file_with_profile,
     lock_file_readonly,
     matches_any_pattern,
+    replace_version_in_filename,
     unlock_file_writable,
 )
+from obol.plugins.filmcraft import FilmCraftPlugin
 from obol.plugins.reaper import ReaperPlugin
 
 
@@ -152,10 +155,16 @@ class ObolWorkspace:
         save_component_snapshot(project_root, snapshot)
 
         if seed_initial_working:
+            resolved_seed = self.hub.template_manager.resolve_seed_template(
+                software=sw_key,
+                project_root=project_root,
+                task_template=tt,
+                seed_override=seed_override,
+            )
             used_seed_name = (
-                seed_override
-                if seed_override and self.hub.template_manager.get_seed_file_path(seed_override)
-                else tt.seed_file_template
+                resolved_seed.display_label()
+                if resolved_seed is not None
+                else (seed_override or tt.seed_file_template)
             )
             self.version_up_working(
                 project_root=project_root,
@@ -187,11 +196,14 @@ class ObolWorkspace:
         plugin = self.hub.plugin_registry.get(profile.plugin)
 
         tt = self.hub.template_manager.get_task_template(snapshot.task_template)
-        seed_path = (
-            self.hub.template_manager.get_seed_file_path(seed_file_override)
-            if seed_file_override
-            else None
-        ) or self.hub.template_manager.get_seed_file_path(tt.seed_file_template)
+        resolved_seed = self.hub.template_manager.resolve_seed_template(
+            software=snapshot.software,
+            project_root=project_root,
+            task_template=tt,
+            seed_override=seed_file_override,
+        )
+        seed_path = resolved_seed.primary_file if resolved_seed is not None else None
+        seed_version_dir = resolved_seed.version_dir if resolved_seed is not None else None
 
         existing_vers = {v.version: v for v in snapshot.working_versions}
         next_ver_num = max(existing_vers.keys(), default=0) + 1
@@ -221,6 +233,7 @@ class ObolWorkspace:
             target_version_dir=target_ver_dir,
             strategy=strategy,
             seed_file_path=seed_path,
+            seed_version_dir=seed_version_dir,
         )
 
         tracked: list[TrackedFile] = []
@@ -238,6 +251,11 @@ class ObolWorkspace:
 
         primary_rel = normalize_rel_path(str(new_primary_abs.relative_to(comp_dir)))
         folder_rel = normalize_rel_path(str(target_ver_dir.relative_to(comp_dir)))
+        used_seed = (strategy == VersionUpStrategy.FROM_SEED_TEMPLATE) or (parent_bundle is None)
+        custom_meta: dict[str, Any] = {}
+        if used_seed and resolved_seed is not None:
+            custom_meta["seed_template"] = resolved_seed.reference_spec()
+
         bundle = VersionBundle(
             version=next_ver_num,
             folder_rel=folder_rel,
@@ -247,6 +265,7 @@ class ObolWorkspace:
             comment=comment or f"Working version v{next_ver_num:03d}",
             parent_version=parent_bundle.version if parent_bundle else 0,
             tags=list(tags or []),
+            custom=custom_meta,
         )
         snapshot.working_versions.append(bundle)
 
@@ -258,16 +277,178 @@ class ObolWorkspace:
                 if next_ver_num not in used_list:
                     used_list.append(next_ver_num)
 
+        event_payload: dict[str, Any] = {
+            "version": next_ver_num,
+            "parent_version": bundle.parent_version,
+            "folder_rel": folder_rel,
+            "primary_file": primary_rel,
+            "strategy": (strategy or profile.version_up_strategy).value,
+            "comment": bundle.comment,
+        }
+        if used_seed and resolved_seed is not None:
+            event_payload["seed_ref"] = resolved_seed.reference_spec()
+
+        evt = append_event(
+            project_root,
+            norm_comp,
+            "WORKING_VERSIONED",
+            event_payload,
+        )
+        snapshot.last_event_id = evt.id
+        save_component_snapshot(project_root, snapshot)
+        ProjectIndex(project_root).index_component(snapshot)
+        return bundle
+
+    def prepare_next_working_version(
+        self,
+        project_root: Path,
+        component_path: str,
+        source_version: Optional[int] = None,
+        extension: str = "",
+    ) -> dict[str, Any]:
+        """Reserves working/vNNN/ and returns the target filename for an in-app Increment Save."""
+        norm_comp = normalize_rel_path(component_path)
+        comp_dir = project_root / norm_comp
+        snapshot = load_component_snapshot(project_root, norm_comp)
+        profile = self.hub.get_software_profile(snapshot.software)
+
+        existing_vers = {v.version: v for v in snapshot.working_versions}
+        disk_vers: list[int] = []
+        working_root = comp_dir / "working"
+        if working_root.is_dir():
+            for child in working_root.iterdir():
+                if child.is_dir():
+                    m = re.match(r"^v(\d+)$", child.name, re.IGNORECASE)
+                    if m:
+                        disk_vers.append(int(m.group(1)))
+
+        next_ver_num = max(list(existing_vers.keys()) + disk_vers, default=0) + 1
+        ver_label = f"v{next_ver_num:03d}"
+        target_ver_dir = working_root / ver_label
+        target_ver_dir.mkdir(parents=True, exist_ok=True)
+
+        parent_bundle: Optional[VersionBundle] = None
+        if existing_vers:
+            src_v = source_version if (source_version and source_version in existing_vers) else max(existing_vers.keys())
+            parent_bundle = existing_vers[src_v]
+
+        comp_leaf = norm_comp.split("/")[-1]
+        if parent_bundle and parent_bundle.primary_file:
+            new_name = replace_version_in_filename(Path(parent_bundle.primary_file).name, next_ver_num, comp_leaf)
+        else:
+            ext = extension or (profile.extensions[0] if profile.extensions else ".rpp")
+            if not ext.startswith("."):
+                ext = f".{ext}"
+            new_name = f"{comp_leaf}_{ver_label}{ext}"
+
+        primary_abs = (target_ver_dir / new_name).resolve()
+        return {
+            "version": next_ver_num,
+            "version_label": ver_label,
+            "parent_version": parent_bundle.version if parent_bundle else 0,
+            "folder_rel": f"working/{ver_label}",
+            "version_dir": target_ver_dir.resolve(),
+            "primary_file": primary_abs,
+            "primary_rel": f"working/{ver_label}/{new_name}",
+        }
+
+    def register_saved_working_version(
+        self,
+        project_root: Path,
+        component_path: str,
+        version: int,
+        primary_file: Path,
+        parent_version: int = 0,
+        comment: str = "",
+        tags: Optional[list[str]] = None,
+    ) -> VersionBundle:
+        """Registers a working file saved directly by a DCC (e.g. REAPER Increment Save) into working/vNNN/."""
+        primary_abs = Path(primary_file).expanduser().resolve()
+        if not primary_abs.is_file():
+            raise FileNotFoundError(f"Saved working file does not exist on disk: {primary_abs}")
+
+        norm_comp = normalize_rel_path(component_path)
+        comp_dir = (project_root / norm_comp).resolve()
+        snapshot = load_component_snapshot(project_root, norm_comp)
+        profile = self.hub.get_software_profile(snapshot.software)
+        plugin = self.hub.plugin_registry.get(profile.plugin)
+
+        ver_dir = primary_abs.parent.resolve()
+        existing_vers = {v.version: v for v in snapshot.working_versions}
+        prev_bundle: Optional[VersionBundle] = None
+        if parent_version and parent_version in existing_vers:
+            prev_bundle = existing_vers[parent_version]
+        else:
+            prior = [v for v in existing_vers.values() if v.version < version]
+            if prior:
+                prev_bundle = max(prior, key=lambda v: v.version)
+
+        prev_ver_dir = (comp_dir / prev_bundle.folder_rel).resolve() if prev_bundle else None
+        if profile.lock_previous_versions and prev_ver_dir and prev_ver_dir.is_dir() and prev_ver_dir != ver_dir:
+            for old_file in prev_ver_dir.rglob("*"):
+                if old_file.is_file():
+                    lock_file_readonly(old_file)
+
+        ctx = TaskContext(
+            project_root=project_root,
+            component_path=norm_comp,
+            component_dir=comp_dir,
+            software_profile=profile,
+        )
+        plugin.on_version_created(ver_dir, primary_abs, prev_ver_dir, ctx)
+
+        tracked: list[TrackedFile] = []
+        for fpath in sorted(ver_dir.rglob("*")):
+            if not fpath.is_file() or fpath.name.startswith(".") or ".backups" in fpath.parts:
+                continue
+            rel_to_ver = fpath.relative_to(ver_dir).as_posix()
+            if matches_any_pattern(rel_to_ver, fpath.name, profile.ignore_patterns):
+                continue
+            rel = normalize_rel_path(str(fpath.relative_to(comp_dir)))
+            tracked.append(
+                TrackedFile(
+                    rel_path=rel,
+                    sha256=compute_file_sha256(fpath),
+                    size_bytes=fpath.stat().st_size,
+                    file_type=fpath.suffix.lstrip(".").lower(),
+                )
+            )
+
+        primary_rel = normalize_rel_path(str(primary_abs.relative_to(comp_dir)))
+        folder_rel = normalize_rel_path(str(ver_dir.relative_to(comp_dir)))
+        resolved_parent = prev_bundle.version if prev_bundle else parent_version
+        bundle = VersionBundle(
+            version=version,
+            folder_rel=folder_rel,
+            primary_file=primary_rel,
+            files=tracked,
+            created_at=utc_now_iso(),
+            comment=comment or f"Increment saved v{version:03d}",
+            parent_version=resolved_parent,
+            tags=list(tags or []),
+        )
+        snapshot.working_versions = sorted(
+            [v for v in snapshot.working_versions if v.version != version] + [bundle],
+            key=lambda v: v.version,
+        )
+
+        _, used_repo_paths = plugin.inspect_dependencies(primary_abs, ctx)
+        for rpath in used_repo_paths:
+            if rpath in snapshot.repo_assets:
+                used_list = snapshot.repo_assets[rpath].used_by_working_versions
+                if version not in used_list:
+                    used_list.append(version)
+
         evt = append_event(
             project_root,
             norm_comp,
             "WORKING_VERSIONED",
             {
-                "version": next_ver_num,
+                "version": version,
                 "parent_version": bundle.parent_version,
                 "folder_rel": folder_rel,
                 "primary_file": primary_rel,
-                "strategy": (strategy or profile.version_up_strategy).value,
+                "strategy": "increment_save",
                 "comment": bundle.comment,
             },
         )
@@ -1188,6 +1369,9 @@ class ObolWorkspace:
         if relink_map and primary_abs.suffix.lower() == ".rpp":
             ReaperPlugin.relink_rpp_references(primary_abs, relink_map)
             Reconciler.reconcile_component(project_root, norm_comp)
+        elif relink_map and primary_abs.suffix.lower() == ".fcproj":
+            FilmCraftPlugin.relink_fcproj_references(primary_abs, relink_map)
+            Reconciler.reconcile_component(project_root, norm_comp)
 
         return collected_assets
 
@@ -1628,7 +1812,22 @@ class ObolWorkspace:
             )
             if not latest_file.is_file():
                 latest_file = self._match_bundle_file(comp_dir, media_resolved, curr_tf, latest_bundle) or media_resolved
+            available_versions: list[dict[str, Any]] = []
+            for v in sorted(asset.versions, key=lambda b: b.version):
+                cand = (comp_dir / v.primary_file).resolve() if v.primary_file else None
+                if cand is None or not cand.is_file():
+                    cand = self._match_bundle_file(comp_dir, media_resolved, curr_tf, v)
+                if cand is not None and cand.is_file():
+                    available_versions.append({
+                        "version": v.version,
+                        "version_label": v.version_label,
+                        "file_path": cand,
+                        "file_name": cand.name,
+                        "is_latest": v.version == latest_bundle.version,
+                        "comment": v.comment,
+                    })
             up_to_date = latest_bundle.version <= curr_ver
+            media_kind = "midi" if media_resolved.suffix.lower() in (".mid", ".midi") else "media"
             return {
                 "component": matched_comp,
                 "kind": "repo",
@@ -1639,6 +1838,8 @@ class ObolWorkspace:
                 "latest_file": latest_file,
                 "up_to_date": up_to_date,
                 "update_available": (not up_to_date) and latest_file.is_file() and latest_file != media_resolved,
+                "media_kind": media_kind,
+                "available_versions": available_versions,
             }
 
         # kind == "published"
@@ -1660,8 +1861,21 @@ class ObolWorkspace:
             else None
         )
         matched_latest = self._match_bundle_file(comp_dir, media_resolved, curr_tf, latest_bundle)
+        available_versions = []
+        for v in sorted(versions, key=lambda b: b.version):
+            cand = self._match_bundle_file(comp_dir, media_resolved, curr_tf, v)
+            if cand is not None and cand.is_file():
+                available_versions.append({
+                    "version": v.version,
+                    "version_label": v.version_label,
+                    "file_path": cand,
+                    "file_name": cand.name,
+                    "is_latest": v.version == latest_bundle.version,
+                    "comment": v.comment,
+                })
         up_to_date = latest_bundle.version <= curr_ver
         latest_file = matched_latest or media_resolved
+        media_kind = "midi" if media_resolved.suffix.lower() in (".mid", ".midi") else "media"
         return {
             "component": matched_comp,
             "kind": "published",
@@ -1672,4 +1886,171 @@ class ObolWorkspace:
             "latest_file": latest_file,
             "up_to_date": up_to_date,
             "update_available": (not up_to_date) and (matched_latest is not None) and (matched_latest != media_resolved),
+            "media_kind": media_kind,
+            "available_versions": available_versions,
         }
+
+    def describe_asset_file(self, project_root: Path, media_file_path: Path) -> Optional[dict[str, Any]]:
+        """Returns a JSON-serializable asset metadata dict for REAPER P_EXT:OBOL_ASSET tracking."""
+        info = self.find_newer_asset_version(project_root, media_file_path)
+        if info is None:
+            return None
+        curr_file = Path(info["current_file"])
+        return {
+            "project_root": str(Path(project_root).resolve()),
+            "scope": str(info["kind"]),
+            "component": str(info["component"]),
+            "asset_key": str(info["asset_key"]),
+            "version": int(info["current_version"]),
+            "file_path": str(curr_file),
+            "file_name": curr_file.name,
+            "media_kind": str(info.get("media_kind") or "media"),
+        }
+
+    def resolve_reaper_session_item(
+        self,
+        project_root: Optional[Path],
+        session_item: dict[str, Any],
+    ) -> Optional[dict[str, Any]]:
+        """Resolves a REAPER session take dict (audio or in-project/file-ref MIDI) to its Obol asset & newer versions."""
+        raw_ext = session_item.get("obol_ext")
+        meta: dict[str, Any] = {}
+        if isinstance(raw_ext, dict):
+            meta = dict(raw_ext)
+        elif isinstance(raw_ext, str) and raw_ext.strip():
+            try:
+                parsed = json.loads(raw_ext)
+                if isinstance(parsed, dict):
+                    meta = parsed
+            except (json.JSONDecodeError, TypeError, ValueError):
+                meta = {}
+
+        candidate_roots: list[Path] = []
+        if project_root is not None:
+            pr = Path(project_root).expanduser().resolve()
+            if (pr / ".obol" / "project.toml").is_file() or pr.is_dir():
+                candidate_roots.append(pr)
+        meta_root_str = str(meta.get("project_root") or "").strip()
+        if meta_root_str:
+            mr = Path(meta_root_str).expanduser().resolve()
+            if (mr / ".obol" / "project.toml").is_file() and mr not in candidate_roots:
+                candidate_roots.append(mr)
+        if not candidate_roots:
+            return None
+
+        info: Optional[dict[str, Any]] = None
+        matched_by = ""
+
+        # Tier 1: direct file_path match (audio, video, and file-ref MIDI)
+        fpath_str = str(session_item.get("file_path") or "").strip()
+        if fpath_str:
+            for root in candidate_roots:
+                info = self.find_newer_asset_version(root, Path(fpath_str))
+                if info is not None:
+                    matched_by = "file_path"
+                    break
+
+        # Tier 2: P_EXT:OBOL_ASSET metadata match (critical for in-project MIDI whose file_path is empty)
+        if info is None and meta:
+            meta_fpath = str(meta.get("file_path") or "").strip()
+            if meta_fpath:
+                for root in candidate_roots:
+                    info = self.find_newer_asset_version(root, Path(meta_fpath))
+                    if info is not None:
+                        matched_by = "obol_ext"
+                        break
+
+            if info is None:
+                comp = normalize_rel_path(str(meta.get("component") or ""))
+                scope = str(meta.get("scope") or meta.get("kind") or "").strip()
+                asset_key = normalize_rel_path(str(meta.get("asset_key") or ""))
+                try:
+                    ver_num = int(meta.get("version") or 0)
+                except (TypeError, ValueError):
+                    ver_num = 0
+                if comp and asset_key:
+                    for root in candidate_roots:
+                        comp_dir = root / comp
+                        if not (comp_dir / "working").is_dir():
+                            continue
+                        snap = load_component_snapshot(root, comp)
+                        versions: list[VersionBundle] = []
+                        if scope == "repo" and asset_key in snap.repo_assets:
+                            versions = list(snap.repo_assets[asset_key].versions)
+                        elif scope == "published":
+                            if asset_key == "__legacy__":
+                                versions = list(snap.published_versions)
+                            elif asset_key in snap.published_deliverables:
+                                versions = list(snap.published_deliverables[asset_key].versions)
+                        if not versions:
+                            continue
+                        curr_b = next((v for v in versions if v.version == ver_num), None) or min(
+                            versions, key=lambda v: v.version
+                        )
+                        rel_f = curr_b.primary_file or (curr_b.files[0].rel_path if curr_b.files else "")
+                        if rel_f:
+                            info = self.find_newer_asset_version(root, comp_dir / rel_f)
+                            if info is not None:
+                                matched_by = "obol_ext"
+                                break
+
+        # Tier 3: untracked in-project MIDI take-name match
+        is_midi = bool(session_item.get("is_midi"))
+        take_name = str(session_item.get("take_name") or "").strip()
+        if info is None and is_midi and take_name:
+            cleaned = re.sub(r"(?:\s+-\s+Track\s+\d+|\s+\(Track\s+\d+\)|\s+\[\d+\])$", "", take_name, flags=re.IGNORECASE).strip()
+            cleaned_lower = cleaned.lower()
+            cleaned_stem = Path(cleaned).stem.lower()
+            for root in candidate_roots:
+                midi_entries = [
+                    e
+                    for e in self.list_importable_assets(root)
+                    if e.get("exists") and Path(str(e.get("file_name", ""))).suffix.lower() in (".mid", ".midi")
+                ]
+                exact_name_matches = [e for e in midi_entries if str(e.get("file_name", "")).lower() == cleaned_lower]
+                chosen_entry: Optional[dict[str, Any]] = None
+                if exact_name_matches:
+                    distinct_assets = {(e["scope"], e["component"], e["asset_key"]) for e in exact_name_matches}
+                    if len(distinct_assets) == 1:
+                        chosen_entry = min(exact_name_matches, key=lambda e: int(e.get("version", 0)))
+                else:
+                    stem_matches = [
+                        e
+                        for e in midi_entries
+                        if Path(str(e.get("file_name", ""))).stem.lower() == cleaned_stem
+                    ]
+                    distinct_assets = {(e["scope"], e["component"], e["asset_key"]) for e in stem_matches}
+                    if len(distinct_assets) == 1:
+                        chosen_entry = min(stem_matches, key=lambda e: int(e.get("version", 0)))
+
+                if chosen_entry is not None:
+                    info = self.find_newer_asset_version(root, Path(chosen_entry["file_path"]))
+                    if info is not None:
+                        matched_by = "take_name"
+                        break
+
+        if info is None:
+            return None
+
+        midi_storage = str(session_item.get("midi_storage") or "")
+        if not is_midi and info.get("media_kind") == "midi":
+            is_midi = True
+        if is_midi and not midi_storage:
+            midi_storage = "file_ref" if fpath_str else "in_project"
+
+        enriched = dict(info)
+        enriched.update({
+            "matched_by": matched_by,
+            "is_midi": is_midi,
+            "midi_storage": midi_storage,
+            "item_guid": str(session_item.get("item_guid") or ""),
+            "take_guid": str(session_item.get("take_guid") or ""),
+            "item_idx": int(session_item.get("item_idx", -1)),
+            "take_idx": int(session_item.get("take_idx", -1)),
+            "track_name": str(session_item.get("track_name") or ""),
+            "take_name": take_name,
+            "is_active_take": bool(session_item.get("is_active_take", True)),
+            "source_type": str(session_item.get("source_type") or ""),
+            "obol_ext": meta,
+        })
+        return enriched

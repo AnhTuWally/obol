@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-OBOL_INTEGRATION_VERSION = "1.1"
+OBOL_INTEGRATION_VERSION = "1.4"
 
 
 def _lua_long_str(value: str) -> str:
@@ -456,6 +456,154 @@ function M.exec_save_project()
   return { saved = true, active_rpp = M.norm_sep(M.get_active_rpp_path()) }
 end
 
+function M.exec_save_project_as(params)
+  local path = params and params.path or ""
+  if path == "" then
+    error("Missing project path for save_project_as")
+  end
+  local norm_target = M.norm_sep(path)
+  local parent_dir = norm_target:match("^(.*)/[^/]+$")
+  if parent_dir and parent_dir ~= "" then
+    M.ensure_dir(parent_dir)
+  end
+  if not reaper.Main_SaveProjectEx then
+    error("reaper.Main_SaveProjectEx is unavailable in this REAPER version")
+  end
+  reaper.Main_SaveProjectEx(0, path, 8) -- &8: Save As (set as new active project filename)
+  local after_rpp = M.norm_sep(M.get_active_rpp_path())
+  local switched_in_place = (M.norm_key(after_rpp) == M.norm_key(norm_target))
+  local reloaded = false
+  if not switched_in_place and params.ensure_open ~= false then
+    reaper.Main_openProject("noprompt:" .. path)
+    reloaded = true
+    after_rpp = M.norm_sep(M.get_active_rpp_path())
+  end
+  return {
+    saved = true,
+    path = norm_target,
+    active_rpp = after_rpp,
+    switched_in_place = switched_in_place,
+    reloaded = reloaded,
+    dirty = (reaper.IsProjectDirty(0) == 1),
+  }
+end
+
+local function basename(p)
+  if not p then return "" end
+  return M.norm_sep(p):match("([^/]+)$") or ""
+end
+
+local function is_midi_path(p)
+  if not p then return false end
+  return M.norm_sep(p):lower():match("%.midi?$") ~= nil
+end
+
+local function create_source_from_file(path, force_no_midi_imp)
+  if is_midi_path(path) and reaper.PCM_Source_CreateFromFileEx then
+    return reaper.PCM_Source_CreateFromFileEx(path, force_no_midi_imp and true or false)
+  end
+  return reaper.PCM_Source_CreateFromFile(path)
+end
+
+local function get_source_length_seconds(src, item_pos, playrate)
+  if not src then return 0 end
+  local len, is_qn = reaper.GetMediaSourceLength(src)
+  if not len or len <= 0 then return 0 end
+  local rate = (playrate and playrate > 0) and playrate or 1.0
+  if is_qn then
+    local start_qn = reaper.TimeMap2_timeToQN(0, item_pos or 0)
+    local end_time = reaper.TimeMap2_QNToTime(0, start_qn + len)
+    return math.max(0, (end_time - (item_pos or 0)) / rate)
+  end
+  return len / rate
+end
+
+local function get_take_ext(item, take)
+  if take then
+    local ok, val = reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:OBOL_ASSET", "", false)
+    if ok and val and val ~= "" then return val end
+  end
+  if item then
+    local ok, val = reaper.GetSetMediaItemInfo_String(item, "P_EXT:OBOL_ASSET", "", false)
+    if ok and val and val ~= "" then return val end
+  end
+  return ""
+end
+
+local function set_take_ext(item, take, meta_json)
+  if not meta_json or meta_json == "" then return end
+  if take then
+    reaper.GetSetMediaItemTakeInfo_String(take, "P_EXT:OBOL_ASSET", meta_json, true)
+  end
+  if item and (not take or reaper.CountTakes(item) <= 1 or reaper.GetActiveTake(item) == take) then
+    reaper.GetSetMediaItemInfo_String(item, "P_EXT:OBOL_ASSET", meta_json, true)
+  end
+end
+
+local function compute_updated_take_name(old_name, old_path, new_path)
+  local new_base = basename(new_path)
+  if not old_name or old_name == "" then
+    return new_base
+  end
+  local old_base = basename(old_path)
+  if old_base == "" then
+    return old_name
+  end
+  local old_stem = old_base:match("^(.*)%.[^%.]+$") or old_base
+  local new_stem = new_base:match("^(.*)%.[^%.]+$") or new_base
+  local old_nl = old_name:lower()
+  local old_bl = old_base:lower()
+  local old_sl = old_stem:lower()
+  if old_nl == old_bl then
+    return new_base
+  elseif old_nl == old_sl then
+    return new_stem
+  elseif #old_nl > #old_bl and old_nl:sub(1, #old_bl) == old_bl then
+    return new_base .. old_name:sub(#old_base + 1)
+  elseif #old_nl > #old_sl and old_nl:sub(1, #old_sl) == old_sl then
+    return new_stem .. old_name:sub(#old_stem + 1)
+  end
+  return old_name
+end
+
+local function snapshot_all_take_guids()
+  local seen = {}
+  local icnt = reaper.CountMediaItems(0)
+  for i = 0, icnt - 1 do
+    local it = reaper.GetMediaItem(0, i)
+    local tcnt = reaper.CountTakes(it)
+    for t = 0, tcnt - 1 do
+      local tk = reaper.GetTake(it, t)
+      if tk then
+        local _, tg = reaper.GetSetMediaItemTakeInfo_String(tk, "GUID", "", false)
+        if tg and tg ~= "" then seen[tg] = true end
+      end
+    end
+  end
+  return seen
+end
+
+local function merge_asset_meta(existing_raw, override_tbl, target_path)
+  local merged = {}
+  if existing_raw and existing_raw ~= "" then
+    local parsed = json.decode(existing_raw)
+    if type(parsed) == "table" then
+      for k, v in pairs(parsed) do
+        merged[k] = v
+      end
+    end
+  end
+  if type(override_tbl) == "table" then
+    for k, v in pairs(override_tbl) do
+      merged[k] = v
+    end
+  end
+  merged.file_path = M.norm_sep(target_path)
+  merged.file_name = basename(target_path)
+  merged.media_kind = is_midi_path(target_path) and "midi" or "media"
+  return json.encode(merged)
+end
+
 function M.exec_insert_media(params)
   local paths = params.file_paths or {}
   if #paths == 0 then
@@ -470,23 +618,41 @@ function M.exec_insert_media(params)
   local mode_int = mode_map[mode_str]
   if mode_int == nil then mode_int = 1 end
 
-  local meta_json = nil
-  if params.asset_meta and next(params.asset_meta) ~= nil then
-    meta_json = json.encode(params.asset_meta)
-  end
+  local metas = params.asset_metas or {}
+  local shared_meta = params.asset_meta
 
   reaper.Undo_BeginBlock()
   local inserted = 0
-  for _, fpath in ipairs(paths) do
+  for idx, fpath in ipairs(paths) do
+    local before_guids = snapshot_all_take_guids()
     local ok = reaper.InsertMedia(fpath, mode_int)
     if ok then
       inserted = inserted + 1
-      if meta_json then
+      local ov = (type(metas[idx]) == "table" and metas[idx]) or shared_meta
+      local meta_json = merge_asset_meta(nil, ov, fpath)
+      local tagged_any = false
+      local icnt = reaper.CountMediaItems(0)
+      for i = 0, icnt - 1 do
+        local item = reaper.GetMediaItem(0, i)
+        local tcnt = reaper.CountTakes(item)
+        for t = 0, tcnt - 1 do
+          local take = reaper.GetTake(item, t)
+          if take then
+            local _, tg = reaper.GetSetMediaItemTakeInfo_String(take, "GUID", "", false)
+            if tg ~= "" and not before_guids[tg] then
+              set_take_ext(item, take, meta_json)
+              tagged_any = true
+            end
+          end
+        end
+      end
+      if not tagged_any then
         local sel_cnt = reaper.CountSelectedMediaItems(0)
         for i = 0, sel_cnt - 1 do
           local item = reaper.GetSelectedMediaItem(0, i)
           if item then
-            reaper.GetSetMediaItemInfo_String(item, "P_EXT:OBOL_ASSET", meta_json, true)
+            local take = reaper.GetActiveTake(item)
+            set_take_ext(item, take, meta_json)
           end
         end
       end
@@ -515,24 +681,41 @@ function M.exec_query_session_media()
   local item_cnt = reaper.CountMediaItems(0)
   for i = 0, item_cnt - 1 do
     local item = reaper.GetMediaItem(0, i)
+    local _, item_guid = reaper.GetSetMediaItemInfo_String(item, "GUID", "", false)
     local track = reaper.GetMediaItemTrack(item)
     local track_name = ""
     if track then
       _, track_name = reaper.GetTrackName(track)
     end
-    local _, obol_ext = reaper.GetSetMediaItemInfo_String(item, "P_EXT:OBOL_ASSET", "", false)
+    local active_take = reaper.GetActiveTake(item)
     local take_cnt = reaper.CountTakes(item)
     for t = 0, take_cnt - 1 do
       local take = reaper.GetTake(item, t)
       if take then
         local src = reaper.GetMediaItemTake_Source(take)
-        local fname = root_source_filename(src)
-        if fname and fname ~= "" then
+        local fname = root_source_filename(src) or ""
+        local is_midi = reaper.TakeIsMIDI(take) == true
+        local source_type = src and (reaper.GetMediaSourceType(src, "") or "") or ""
+        local obol_ext = get_take_ext(item, take)
+        local _, take_guid = reaper.GetSetMediaItemTakeInfo_String(take, "GUID", "", false)
+        local _, take_name = reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", "", false)
+        if fname ~= "" or is_midi or obol_ext ~= "" then
+          local midi_storage = ""
+          if is_midi then
+            midi_storage = (fname ~= "" and "file_ref" or "in_project")
+          end
           items[#items + 1] = {
             item_idx = i,
             take_idx = t,
+            item_guid = item_guid or "",
+            take_guid = take_guid or "",
             track_name = track_name or "",
+            take_name = take_name or "",
             file_path = M.norm_sep(fname),
+            is_midi = is_midi,
+            midi_storage = midi_storage,
+            source_type = source_type,
+            is_active_take = (take == active_take),
             obol_ext = obol_ext or "",
           }
         end
@@ -549,45 +732,230 @@ function M.exec_update_media_sources(params)
     rep_norm[M.norm_key(k)] = v
   end
 
+  local default_update_mode = params.update_mode or "replace_source"
+  local default_midi_mode = params.midi_mode or "preserve"
+  local default_match_length = params.match_length or "auto"
+
+  local by_take_guid = {}
+  local by_item_guid = {}
+  local by_old_path = {}
+  local take_updates = params.take_updates or {}
+  for _, upd in ipairs(take_updates) do
+    if type(upd) == "table" and upd.target_path and upd.target_path ~= "" then
+      if upd.take_guid and upd.take_guid ~= "" then
+        by_take_guid[upd.take_guid] = upd
+      elseif upd.item_guid and upd.item_guid ~= "" then
+        by_item_guid[upd.item_guid] = upd
+      end
+      if upd.old_path and upd.old_path ~= "" then
+        by_old_path[M.norm_key(upd.old_path)] = upd
+      end
+    end
+  end
+
+  local orig_selected = {}
+  local sel_cnt = reaper.CountSelectedMediaItems(0)
+  for s = 0, sel_cnt - 1 do
+    local si = reaper.GetSelectedMediaItem(0, s)
+    if si then orig_selected[#orig_selected + 1] = si end
+  end
+
+  local function deselect_all_items()
+    for s = reaper.CountSelectedMediaItems(0) - 1, 0, -1 do
+      local si = reaper.GetSelectedMediaItem(0, s)
+      if si then reaper.SetMediaItemSelected(si, false) end
+    end
+  end
+
   reaper.Undo_BeginBlock()
   local updated_takes = 0
+  local updated_midi_takes = 0
+  local updated_media_takes = 0
   local updated_items_set = {}
+  local audio_items_for_peaks = {}
+  local midi_convert_queue = {}
+
   local item_cnt = reaper.CountMediaItems(0)
   for i = 0, item_cnt - 1 do
     local item = reaper.GetMediaItem(0, i)
-    local take_cnt = reaper.CountTakes(item)
+    local _, item_guid = reaper.GetSetMediaItemInfo_String(item, "GUID", "", false)
+    local orig_take_cnt = reaper.CountTakes(item)
     local item_touched = false
-    for t = 0, take_cnt - 1 do
+    for t = 0, orig_take_cnt - 1 do
       local take = reaper.GetTake(item, t)
       if take then
+        local _, take_guid = reaper.GetSetMediaItemTakeInfo_String(take, "GUID", "", false)
         local src = reaper.GetMediaItemTake_Source(take)
-        local fname = root_source_filename(src)
-        local target = rep_norm[M.norm_key(fname)]
+        local fname = root_source_filename(src) or ""
+        local ext_raw = get_take_ext(item, take)
+        local ext_path = ""
+        if ext_raw ~= "" then
+          local parsed_ext = json.decode(ext_raw)
+          if type(parsed_ext) == "table" and parsed_ext.file_path then
+            ext_path = tostring(parsed_ext.file_path)
+          end
+        end
+
+        local upd = nil
+        if take_guid ~= "" and by_take_guid[take_guid] then
+          upd = by_take_guid[take_guid]
+        elseif fname ~= "" and by_old_path[M.norm_key(fname)] then
+          upd = by_old_path[M.norm_key(fname)]
+        elseif ext_path ~= "" and by_old_path[M.norm_key(ext_path)] then
+          upd = by_old_path[M.norm_key(ext_path)]
+        elseif item_guid ~= "" and by_item_guid[item_guid] and reaper.GetActiveTake(item) == take then
+          upd = by_item_guid[item_guid]
+        end
+
+        local target = nil
+        if upd then
+          target = upd.target_path
+        elseif fname ~= "" and rep_norm[M.norm_key(fname)] then
+          target = rep_norm[M.norm_key(fname)]
+        elseif ext_path ~= "" and rep_norm[M.norm_key(ext_path)] then
+          target = rep_norm[M.norm_key(ext_path)]
+        end
+
         if target and target ~= "" then
-          local new_src = reaper.PCM_Source_CreateFromFile(target)
+          local u_mode = (upd and upd.update_mode) or default_update_mode
+          local m_mode = (upd and upd.midi_mode) or default_midi_mode
+          local l_mode = (upd and upd.match_length) or default_match_length
+
+          local was_midi = reaper.TakeIsMIDI(take) == true
+          local was_in_project_midi = was_midi and (fname == "")
+          local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+          local old_item_len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+          local startoffs = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
+          local playrate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
+          local old_src_len_sec = get_source_length_seconds(src, item_pos, playrate)
+          local _, old_take_name = reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", "", false)
+          local ref_old_path = (fname ~= "" and fname) or ext_path
+
+          local new_src = create_source_from_file(target, true)
           if new_src then
-            reaper.SetMediaItemTake_Source(take, new_src)
-            updated_takes = updated_takes + 1
-            item_touched = true
+            local target_take = take
+            local swapped_ok = false
+            if u_mode == "add_take" then
+              local added = reaper.AddTakeToMediaItem(item)
+              if added then
+                swapped_ok = reaper.SetMediaItemTake_Source(added, new_src)
+                if swapped_ok then
+                  target_take = added
+                  reaper.SetActiveTake(added)
+                end
+              end
+            else
+              swapped_ok = reaper.SetMediaItemTake_Source(take, new_src)
+            end
+
+            if not swapped_ok then
+              if reaper.PCM_Source_Destroy then
+                reaper.PCM_Source_Destroy(new_src)
+              end
+            else
+              local final_take_name = (u_mode == "add_take")
+                and basename(target)
+                or compute_updated_take_name(old_take_name, ref_old_path, target)
+              if final_take_name and final_take_name ~= "" then
+                reaper.GetSetMediaItemTakeInfo_String(target_take, "P_NAME", final_take_name, true)
+              end
+
+              if l_mode == "always" or (
+                l_mode == "auto"
+                and old_src_len_sec > 0
+                and math.abs(old_item_len - old_src_len_sec) <= 0.08
+                and math.abs(startoffs) <= 0.002
+              ) then
+                local cur_src = reaper.GetMediaItemTake_Source(target_take)
+                local cur_rate = reaper.GetMediaItemTakeInfo_Value(target_take, "D_PLAYRATE")
+                local new_len_sec = get_source_length_seconds(cur_src, item_pos, cur_rate)
+                if new_len_sec > 0 then
+                  reaper.SetMediaItemInfo_Value(item, "D_LENGTH", new_len_sec)
+                end
+              end
+
+              local meta_json = merge_asset_meta(ext_raw, upd and upd.asset_meta, target)
+              set_take_ext(item, target_take, meta_json)
+
+              local target_is_midi = is_midi_path(target)
+              local want_in_project = target_is_midi and (
+                m_mode == "in_project"
+                or (m_mode == "preserve" and was_in_project_midi)
+              )
+              if want_in_project then
+                midi_convert_queue[#midi_convert_queue + 1] = {
+                  item = item,
+                  take = target_take,
+                  meta_json = meta_json,
+                  take_name = final_take_name,
+                  restore_active = (u_mode ~= "add_take"),
+                }
+              elseif not target_is_midi then
+                audio_items_for_peaks[#audio_items_for_peaks + 1] = item
+              end
+
+              updated_takes = updated_takes + 1
+              if target_is_midi then
+                updated_midi_takes = updated_midi_takes + 1
+              else
+                updated_media_takes = updated_media_takes + 1
+              end
+              item_touched = true
+            end
           end
         end
       end
     end
     if item_touched then
       reaper.UpdateItemInProject(item)
-      reaper.SetMediaItemSelected(item, true)
       updated_items_set[i] = true
     end
   end
-  if updated_takes > 0 then
+
+  if #midi_convert_queue > 0 then
+    for _, entry in ipairs(midi_convert_queue) do
+      deselect_all_items()
+      reaper.SetMediaItemSelected(entry.item, true)
+      local prev_active = reaper.GetActiveTake(entry.item)
+      reaper.SetActiveTake(entry.take)
+      reaper.Main_OnCommand(40684, 0) -- Item: Convert active take MIDI to in-project MIDI source data
+      set_take_ext(entry.item, entry.take, entry.meta_json)
+      if entry.take_name and entry.take_name ~= "" then
+        reaper.GetSetMediaItemTakeInfo_String(entry.take, "P_NAME", entry.take_name, true)
+      end
+      if entry.restore_active and prev_active and prev_active ~= entry.take then
+        reaper.SetActiveTake(prev_active)
+      end
+      reaper.UpdateItemInProject(entry.item)
+    end
+  end
+
+  if #audio_items_for_peaks > 0 then
+    deselect_all_items()
+    for _, it in ipairs(audio_items_for_peaks) do
+      reaper.SetMediaItemSelected(it, true)
+    end
     reaper.Main_OnCommand(40441, 0) -- Peaks: Rebuild peaks for selected items
+  end
+
+  deselect_all_items()
+  for _, si in ipairs(orig_selected) do
+    reaper.SetMediaItemSelected(si, true)
+  end
+  if updated_takes > 0 then
     reaper.UpdateArrange()
   end
   reaper.Undo_EndBlock("Obol: Update Asset Versions", -1)
 
   local updated_items = 0
   for _ in pairs(updated_items_set) do updated_items = updated_items + 1 end
-  return { updated_takes = updated_takes, updated_items = updated_items }
+  return {
+    updated_takes = updated_takes,
+    updated_items = updated_items,
+    updated_midi_takes = updated_midi_takes,
+    updated_media_takes = updated_media_takes,
+    update_mode = default_update_mode,
+  }
 end
 
 function M.exec_render_direct(params)
@@ -735,6 +1103,8 @@ function M.dispatch(action, params)
     return M.exec_open_project(params)
   elseif action == "save_project" then
     return M.exec_save_project()
+  elseif action == "save_project_as" then
+    return M.exec_save_project_as(params)
   elseif action == "insert_media" then
     return M.exec_insert_media(params)
   elseif action == "query_session_media" then
@@ -914,6 +1284,35 @@ end
 local ok, note = reaper.GetUserInputs("Obol — Save & Version Up", 1, "Version Note (optional):,extrawidth=200", "")
 if not ok then return end
 
+if reaper.Main_SaveProjectEx then
+  local pcode, pout = obol.exec_obol({ "reaper", "prepare-working", "--rpp", rpp, "--json" }, 20000, false)
+  local pdata = obol.json.decode(pout)
+  if pcode ~= 0 or type(pdata) ~= "table" or not pdata.ok or not pdata.primary_file then
+    local msg = (type(pdata) == "table" and pdata.error) or pout or "Failed to prepare next working version."
+    reaper.ShowMessageBox("Obol Version Up failed:\n" .. tostring(msg), "Obol — Version Up", 0)
+    return
+  end
+  reaper.Main_SaveProjectEx(0, pdata.primary_file, 8)
+  local reg_args = {
+    "reaper", "register-working",
+    "--rpp", pdata.primary_file,
+    "--parent-version", tostring(pdata.parent_version or 0),
+    "-m", note or "",
+    "--json",
+  }
+  local rcode, rout = obol.exec_obol(reg_args, 20000, false)
+  local rdata = obol.json.decode(rout)
+  if rcode ~= 0 or type(rdata) ~= "table" or not rdata.ok then
+    local msg = (type(rdata) == "table" and rdata.error) or rout or "Register working version failed."
+    reaper.ShowMessageBox("Obol Version Up failed:\n" .. tostring(msg), "Obol — Version Up", 0)
+    return
+  end
+  if obol.norm_key(obol.get_active_rpp_path()) ~= obol.norm_key(pdata.primary_file) then
+    reaper.Main_openProject("noprompt:" .. pdata.primary_file)
+  end
+  return
+end
+
 reaper.Main_SaveProject(0, false)
 local code, out = obol.exec_obol({ "reaper", "version-up", "--rpp", rpp, "-m", note or "", "--json" }, 20000, false)
 local data = obol.json.decode(out)
@@ -929,11 +1328,76 @@ end
 '''
 
 
+def render_increment_save_action_lua() -> str:
+    return _action_preamble() + r'''
+local rpp = obol.get_active_rpp_path()
+if rpp == "" then
+  reaper.ShowMessageBox("Please save or open a working .rpp file inside an Obol project first.", "Obol — Increment Save", 0)
+  return
+end
+
+if reaper.Main_SaveProjectEx then
+  local pcode, pout = obol.exec_obol({ "reaper", "prepare-working", "--rpp", rpp, "--json" }, 20000, false)
+  local pdata = obol.json.decode(pout)
+  if pcode ~= 0 or type(pdata) ~= "table" or not pdata.ok or not pdata.primary_file then
+    local msg = (type(pdata) == "table" and pdata.error) or pout or "Failed to prepare next working version."
+    reaper.ShowMessageBox("Obol Increment Save failed:\n" .. tostring(msg), "Obol — Increment Save", 0)
+    return
+  end
+  reaper.Main_SaveProjectEx(0, pdata.primary_file, 8)
+  local reg_args = {
+    "reaper", "register-working",
+    "--rpp", pdata.primary_file,
+    "--parent-version", tostring(pdata.parent_version or 0),
+    "-m", "Increment saved from REAPER (" .. tostring(pdata.version_label or "") .. ")",
+    "--json",
+  }
+  local rcode, rout = obol.exec_obol(reg_args, 20000, false)
+  local rdata = obol.json.decode(rout)
+  if rcode ~= 0 or type(rdata) ~= "table" or not rdata.ok then
+    local msg = (type(rdata) == "table" and rdata.error) or rout or "Register working version failed."
+    reaper.ShowMessageBox("Obol Increment Save failed:\n" .. tostring(msg), "Obol — Increment Save", 0)
+    return
+  end
+  if obol.norm_key(obol.get_active_rpp_path()) ~= obol.norm_key(pdata.primary_file) then
+    reaper.Main_openProject("noprompt:" .. pdata.primary_file)
+  end
+  return
+end
+
+reaper.Main_SaveProject(0, false)
+local code, out = obol.exec_obol({ "reaper", "version-up", "--rpp", rpp, "-m", "Increment saved from REAPER", "--json" }, 20000, false)
+local data = obol.json.decode(out)
+if code ~= 0 or type(data) ~= "table" or not data.ok then
+  local msg = (type(data) == "table" and data.error) or out or "Increment Save failed."
+  reaper.ShowMessageBox("Obol Increment Save failed:\n" .. tostring(msg), "Obol — Increment Save", 0)
+  return
+end
+
+if data.primary_file and data.primary_file ~= "" then
+  reaper.Main_openProject("noprompt:" .. data.primary_file)
+end
+'''
+
+
 def render_import_asset_action_lua() -> str:
     return _action_preamble() + r'''
 obol.ensure_bridge_running()
 local rpp = obol.get_active_rpp_path()
 local args = { "reaper", "ui", "--mode", "import" }
+if rpp ~= "" then
+  args[#args + 1] = "--rpp"
+  args[#args + 1] = rpp
+end
+obol.exec_obol(args, -1, true)
+'''
+
+
+def render_update_media_action_lua() -> str:
+    return _action_preamble() + r'''
+obol.ensure_bridge_running()
+local rpp = obol.get_active_rpp_path()
+local args = { "reaper", "ui", "--mode", "update" }
 if rpp ~= "" then
   args[#args + 1] = "--rpp"
   args[#args + 1] = rpp
@@ -1010,8 +1474,10 @@ obol.exec_obol(args, -1, true)
 OBOL_ACTION_SPECS: list[tuple[str, str, object]] = [
     ("obol_bridge.lua", "Obol - Toggle Bridge", render_obol_bridge_lua),
     ("Obol - Open Working File.lua", "Obol - Open Working File", render_open_working_action_lua),
+    ("Obol - Increment Save.lua", "Obol - Increment Save", render_increment_save_action_lua),
     ("Obol - Save and Version Up.lua", "Obol - Save and Version Up", render_version_up_action_lua),
     ("Obol - Import Asset.lua", "Obol - Import Asset", render_import_asset_action_lua),
+    ("Obol - Update Session Media.lua", "Obol - Update Session Media", render_update_media_action_lua),
     ("Obol - Export and Publish.lua", "Obol - Export and Publish", render_export_publish_action_lua),
     ("Obol - Collect External Media.lua", "Obol - Collect External Media", render_collect_media_action_lua),
     ("Obol - Open Obol Studio.lua", "Obol - Open Obol Studio", render_open_studio_action_lua),
@@ -1022,8 +1488,10 @@ def render_obol_toolbar_menu(action_cmd_ids: dict[str, str]) -> str:
     """Generates an importable `MenuSets/Obol_Toolbar.ReaperMenu` file for REAPER."""
     toolbar_items = [
         ("Obol - Open Working File.lua", "Obol: Open"),
+        ("Obol - Increment Save.lua", "Obol: IncSave"),
         ("Obol - Save and Version Up.lua", "Obol: vUp"),
         ("Obol - Import Asset.lua", "Obol: Import"),
+        ("Obol - Update Session Media.lua", "Obol: Update"),
         ("Obol - Export and Publish.lua", "Obol: Publish"),
         ("Obol - Collect External Media.lua", "Obol: Collect"),
         ("Obol - Open Obol Studio.lua", "Obol: Studio"),

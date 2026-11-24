@@ -14,7 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QMimeData, QPoint, Qt, QUrl
 from PySide6.QtGui import QDropEvent
-from PySide6.QtWidgets import QApplication, QTreeWidgetItem
+from PySide6.QtWidgets import QApplication, QComboBox, QMessageBox, QTreeWidgetItem
 
 from obol.cli.main import run_cli
 from obol.core.hub import ObolHub
@@ -26,9 +26,17 @@ from obol.gui.reaper_dialogs import (
     ReaperIntegrationDialog,
     ReaperOpenDialog,
 )
+from obol.plugins.base import unlock_file_writable
 from obol.plugins.reaper_bridge import ReaperBridgeClient, parse_reaper_render_presets
 from obol.plugins.reaper_installer import ReaperInstaller
-from obol.plugins.reaper_scripts import OBOL_ACTION_SPECS
+from obol.plugins.reaper_scripts import (
+    OBOL_ACTION_SPECS,
+    OBOL_INTEGRATION_VERSION,
+    render_increment_save_action_lua,
+    render_obol_lib_lua,
+    render_obol_toolbar_menu,
+    render_version_up_action_lua,
+)
 
 
 class TestReaperIntegration(unittest.TestCase):
@@ -351,6 +359,445 @@ class TestReaperIntegration(unittest.TestCase):
         self.assertEqual(dropped, [])
         del orig_source
         win.close()
+
+    def test_session_item_resolution_midi_and_media_updates_end_to_end(self) -> None:
+        # Verify generated Lua script capabilities & version
+        self.assertEqual(OBOL_INTEGRATION_VERSION, "1.4")
+        action_names = {name for _, name, _ in OBOL_ACTION_SPECS}
+        self.assertIn("Obol - Update Session Media", action_names)
+        self.assertIn("Obol - Increment Save", action_names)
+        lib_lua = render_obol_lib_lua()
+        for token in (
+            "PCM_Source_CreateFromFileEx",
+            "40684",
+            "AddTakeToMediaItem",
+            "take_updates",
+            "P_EXT:OBOL_ASSET",
+            "exec_query_session_media",
+        ):
+            self.assertIn(token, lib_lua)
+
+        proj = self.ws.init_project("midi_media_proj", self.root / "midi_media_proj")
+        rpp_v1 = proj / "audio" / "working" / "v001" / "audio_v001.rpp"
+
+        wav1 = self.root / "bass1.wav"
+        wav2 = self.root / "bass2.wav"
+        wav1.write_bytes(b"BASS-1")
+        wav2.write_bytes(b"BASS-2")
+        _, w_b1 = self.ws.ingest_repo_asset(proj, "audio", wav1, asset_path="audio/bass")
+        _, w_b2 = self.ws.ingest_repo_asset(proj, "audio", wav2, asset_path="audio/bass")
+
+        mid1 = self.root / "chord_prog1.mid"
+        mid2 = self.root / "chord_prog2.mid"
+        mid1.write_bytes(b"MThd-V1")
+        mid2.write_bytes(b"MThd-V2")
+        _, m_b1 = self.ws.ingest_repo_asset(proj, "audio", mid1, asset_path="midi/chord_prog")
+        _, m_b2 = self.ws.ingest_repo_asset(proj, "audio", mid2, asset_path="midi/chord_prog")
+
+        lead_mid1 = self.root / "arp_lead_v001.mid"
+        lead_mid2 = self.root / "arp_lead_v002.mid"
+        lead_mid1.write_bytes(b"MThd-L1")
+        lead_mid2.write_bytes(b"MThd-L2")
+        _, l_b1 = self.ws.ingest_repo_asset(proj, "audio", lead_mid1, asset_path="midi/arp_lead")
+        _, l_b2 = self.ws.ingest_repo_asset(proj, "audio", lead_mid2, asset_path="midi/arp_lead")
+
+        wav_v1_path = (proj / "audio" / w_b1.primary_file).resolve()
+        wav_v2_path = (proj / "audio" / w_b2.primary_file).resolve()
+        mid_v1_path = (proj / "audio" / m_b1.primary_file).resolve()
+        mid_v2_path = (proj / "audio" / m_b2.primary_file).resolve()
+        lead_v1_path = (proj / "audio" / l_b1.primary_file).resolve()
+        lead_v2_path = (proj / "audio" / l_b2.primary_file).resolve()
+
+        # 1. Test 3-tier resolve_reaper_session_item + available_versions
+        ext_meta = self.ws.describe_asset_file(proj, mid_v1_path)
+        self.assertIsNotNone(ext_meta)
+        assert ext_meta is not None
+        self.assertEqual(ext_meta["media_kind"], "midi")
+
+        res_tier1 = self.ws.resolve_reaper_session_item(
+            proj,
+            {
+                "item_idx": 0,
+                "take_idx": 0,
+                "item_guid": "{ITEM-WAV}",
+                "take_guid": "{TAKE-WAV}",
+                "track_name": "Bass",
+                "take_name": wav_v1_path.name,
+                "file_path": str(wav_v1_path),
+                "is_midi": False,
+            },
+        )
+        self.assertIsNotNone(res_tier1)
+        assert res_tier1 is not None
+        self.assertEqual(res_tier1["matched_by"], "file_path")
+        self.assertTrue(res_tier1["update_available"])
+        self.assertEqual([v["version"] for v in res_tier1["available_versions"]], [1, 2])
+
+        res_tier2 = self.ws.resolve_reaper_session_item(
+            proj,
+            {
+                "item_idx": 1,
+                "take_idx": 0,
+                "item_guid": "{ITEM-MID-EXT}",
+                "take_guid": "{TAKE-MID-EXT}",
+                "track_name": "Keys",
+                "take_name": "My Custom Keys",
+                "file_path": "",
+                "is_midi": True,
+                "midi_storage": "in_project",
+                "obol_ext": json.dumps(ext_meta),
+            },
+        )
+        self.assertIsNotNone(res_tier2)
+        assert res_tier2 is not None
+        self.assertEqual(res_tier2["matched_by"], "obol_ext")
+        self.assertTrue(res_tier2["is_midi"])
+        self.assertEqual(res_tier2["midi_storage"], "in_project")
+        self.assertEqual(res_tier2["latest_file"], mid_v2_path)
+
+        res_tier3 = self.ws.resolve_reaper_session_item(
+            proj,
+            {
+                "item_idx": 2,
+                "take_idx": 0,
+                "item_guid": "{ITEM-MID-NAME}",
+                "take_guid": "{TAKE-MID-NAME}",
+                "track_name": "Arp",
+                "take_name": f"{lead_v1_path.stem} - Track 1",
+                "file_path": "",
+                "is_midi": True,
+                "midi_storage": "in_project",
+                "obol_ext": "",
+            },
+        )
+        self.assertIsNotNone(res_tier3)
+        assert res_tier3 is not None
+        self.assertEqual(res_tier3["matched_by"], "take_name")
+        self.assertEqual(res_tier3["latest_file"], lead_v2_path)
+
+        # 2. Live mock daemon covering ReaperImportDialog, ObolMainWindow, and CLI update-media
+        self.bridge.state_path.write_text(
+            json.dumps({
+                "connected": True,
+                "heartbeat": time.time(),
+                "reaper_version": "7.30/win64",
+                "active_rpp": str(rpp_v1),
+                "dirty": False,
+                "selected_tracks": 1,
+            }),
+            encoding="utf-8",
+        )
+
+        session_state = [
+            {
+                "item_idx": 0,
+                "take_idx": 0,
+                "item_guid": "{ITEM-WAV}",
+                "take_guid": "{TAKE-WAV}",
+                "track_name": "Bass",
+                "take_name": wav_v1_path.name,
+                "file_path": str(wav_v1_path),
+                "is_midi": False,
+                "midi_storage": "",
+                "obol_ext": json.dumps(self.ws.describe_asset_file(proj, wav_v1_path)),
+            },
+            {
+                "item_idx": 1,
+                "take_idx": 0,
+                "item_guid": "{ITEM-MID-EXT}",
+                "take_guid": "{TAKE-MID-EXT}",
+                "track_name": "Keys",
+                "take_name": "Chords",
+                "file_path": "",
+                "is_midi": True,
+                "midi_storage": "in_project",
+                "obol_ext": json.dumps(ext_meta),
+            },
+            {
+                "item_idx": 2,
+                "take_idx": 0,
+                "item_guid": "{ITEM-MID-NAME}",
+                "take_guid": "{TAKE-MID-NAME}",
+                "track_name": "Arp",
+                "take_name": f"{lead_v1_path.stem} - Track 1",
+                "file_path": "",
+                "is_midi": True,
+                "midi_storage": "in_project",
+                "obol_ext": "",
+            },
+        ]
+        captured_commands: list[tuple[str, dict]] = []
+        stop_evt = threading.Event()
+
+        def _mock_daemon() -> None:
+            while not stop_evt.is_set():
+                for f in sorted(self.bridge.inbox_dir.glob("*.json")):
+                    req = json.loads(f.read_text(encoding="utf-8"))
+                    f.unlink(missing_ok=True)
+                    action = req["action"]
+                    params = req.get("params") or {}
+                    captured_commands.append((action, params))
+                    if action == "query_session_media":
+                        res = {"items": session_state}
+                    elif action == "insert_media":
+                        res = {"inserted": len(params.get("file_paths") or []), "mode": params.get("mode", "new_track")}
+                    elif action == "update_media_sources":
+                        upds = params.get("take_updates") or []
+                        upd_by_tg = {u.get("take_guid"): u for u in upds if u.get("take_guid")}
+                        midi_cnt = 0
+                        media_cnt = 0
+                        for sit in session_state:
+                            u = upd_by_tg.get(sit["take_guid"])
+                            if u:
+                                targ = Path(u["target_path"])
+                                if u.get("asset_meta"):
+                                    sit["obol_ext"] = json.dumps(u["asset_meta"])
+                                if sit["is_midi"]:
+                                    midi_cnt += 1
+                                    if params.get("midi_mode") == "file_ref":
+                                        sit["file_path"] = str(targ)
+                                        sit["midi_storage"] = "file_ref"
+                                else:
+                                    media_cnt += 1
+                                    sit["file_path"] = str(targ)
+                        res = {
+                            "updated_takes": len(upds),
+                            "updated_items": len(upds),
+                            "updated_midi_takes": midi_cnt,
+                            "updated_media_takes": media_cnt,
+                            "update_mode": params.get("update_mode", "replace_source"),
+                        }
+                    else:
+                        res = {"ok": True}
+                    out_f = self.bridge.outbox_dir / f"{req['id']}.json"
+                    out_f.write_text(json.dumps({"id": req["id"], "ok": True, "result": res}), encoding="utf-8")
+                time.sleep(0.02)
+
+        orig_info = QMessageBox.information
+        orig_warn = QMessageBox.warning
+        QMessageBox.information = staticmethod(lambda *a, **kw: QMessageBox.StandardButton.Ok)  # type: ignore[assignment]
+        QMessageBox.warning = staticmethod(lambda *a, **kw: QMessageBox.StandardButton.Ok)  # type: ignore[assignment]
+
+        t = threading.Thread(target=_mock_daemon, daemon=True)
+        t.start()
+        try:
+            # Verify bridge insert_media forwards per-file asset_metas
+            ins_res = self.bridge.insert_media(
+                [wav_v1_path, mid_v1_path],
+                mode="new_track",
+                asset_metas=[self.ws.describe_asset_file(proj, wav_v1_path) or {}, ext_meta],
+            )
+            self.assertEqual(ins_res["inserted"], 2)
+            self.assertEqual(len(captured_commands[-1][1]["asset_metas"]), 2)
+
+            # Verify CLI dry-run check
+            self.assertEqual(run_cli(["reaper", "update-media", "--rpp", str(rpp_v1), "--check", "--json"], hub=self.hub), 0)
+
+            # Verify ReaperImportDialog(initial_tab=1) lists all 3 items & applies updates
+            dlg = ReaperImportDialog(None, self.hub, self.ws, self.bridge, active_rpp=str(rpp_v1), initial_tab=1)
+            self.assertEqual(dlg.tabs.currentIndex(), 1)
+            self.assertEqual(dlg.updates_table.rowCount(), 3)
+            combo0 = dlg.updates_table.cellWidget(0, 5)
+            self.assertIsInstance(combo0, QComboBox)
+            assert isinstance(combo0, QComboBox)
+            self.assertEqual(combo0.count(), 2)
+            dlg.update_mode_combo.setCurrentIndex(1)  # add_take
+            dlg.midi_mode_combo.setCurrentIndex(1)  # in_project
+            dlg._on_apply_updates()
+            upd_cmds = [p for a, p in captured_commands if a == "update_media_sources"]
+            self.assertEqual(len(upd_cmds), 1)
+            last_cmd_params = upd_cmds[-1]
+            self.assertEqual(last_cmd_params["update_mode"], "add_take")
+            self.assertEqual(last_cmd_params["midi_mode"], "in_project")
+            self.assertEqual(last_cmd_params["match_length"], "auto")
+            self.assertEqual(len(last_cmd_params["take_updates"]), 3)
+            dlg.close()
+
+            # Reset session_state back to v1 and test ObolMainWindow direct update + CLI live update
+            session_state[0]["file_path"] = str(wav_v1_path)
+            session_state[1]["obol_ext"] = json.dumps(ext_meta)
+            win = ObolMainWindow(hub=self.hub, initial_project="midi_media_proj", initial_component="audio")
+            self.assertFalse(win.reaper_update_media_btn.isHidden())
+            upd_res = win._action_update_asset_in_reaper(mid_v2_path, silent=True)
+            self.assertEqual(upd_res["updated_takes"], 1)
+            self.assertEqual(upd_res["updated_midi_takes"], 1)
+            win.close()
+
+            # CLI live update for remaining outdated takes
+            self.assertEqual(run_cli(["reaper", "update-media", "--rpp", str(rpp_v1), "--json"], hub=self.hub), 0)
+        finally:
+            QMessageBox.information = orig_info  # type: ignore[assignment]
+            QMessageBox.warning = orig_warn  # type: ignore[assignment]
+            stop_evt.set()
+            t.join(timeout=2.0)
+
+        # Also test CLI --offline mode on .rpp file
+        unlock_file_writable(rpp_v1)
+        rpp_v1.write_text(
+            f'<REAPER_PROJECT 0.1 "7.0"\n  <TRACK\n    <ITEM\n      <SOURCE MIDI\n        FILE "../../{m_b1.primary_file}"\n      >\n    >\n  >\n>\n',
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            run_cli(["reaper", "update-media", "--offline", "--rpp", str(rpp_v1), "--json"], hub=self.hub),
+            0,
+        )
+        self.assertIn(f"../../{m_b2.primary_file}", rpp_v1.read_text(encoding="utf-8"))
+
+    def test_reaper_increment_save_workspace_bridge_gui_and_cli(self) -> None:
+        lib_lua = render_obol_lib_lua()
+        for token in ("Main_SaveProjectEx(0, path, 8)", "exec_save_project_as", "save_project_as", "switched_in_place"):
+            self.assertIn(token, lib_lua)
+        inc_lua = render_increment_save_action_lua()
+        vup_lua = render_version_up_action_lua()
+        self.assertIn("Main_SaveProjectEx(0, pdata.primary_file, 8)", inc_lua)
+        self.assertIn("Main_SaveProjectEx(0, pdata.primary_file, 8)", vup_lua)
+        self.assertIn("Main_openProject", inc_lua)
+        toolbar = render_obol_toolbar_menu({fname: f"CMD_{i}" for i, (fname, _, _) in enumerate(OBOL_ACTION_SPECS)})
+        self.assertIn("Obol: IncSave", toolbar)
+
+        proj = self.ws.init_project("inc_save_proj", self.root / "inc_save_proj")
+        rpp_v1 = proj / "audio" / "working" / "v001" / "audio_v001.rpp"
+        self.assertTrue(rpp_v1.is_file())
+        v1_orig = rpp_v1.read_text(encoding="utf-8")
+
+        # 1. Workspace prepare_next_working_version + simulated save + register_saved_working_version
+        prof = self.hub.get_software_profile("reaper")
+        prof.lock_previous_versions = True
+        self.hub.set_software_profile(prof)
+
+        prep_w = self.ws.prepare_next_working_version(proj, "audio", source_version=1, extension=".rpp")
+        self.assertEqual(prep_w["version"], 2)
+        target_v2 = Path(prep_w["primary_file"])
+        target_v2.write_text(v1_orig + "; v2 unsaved edits\n", encoding="utf-8")
+        reg_v2 = self.ws.register_saved_working_version(
+            proj,
+            "audio",
+            version=2,
+            primary_file=target_v2,
+            parent_version=1,
+            comment="Manual prepare+register",
+        )
+        self.assertEqual(reg_v2.version, 2)
+        self.assertEqual(rpp_v1.read_text(encoding="utf-8"), v1_orig)
+        self.assertFalse(os.access(rpp_v1, os.W_OK))
+
+        # Reset to clean project for live mock REAPER daemon test (GUI + CLI)
+        proj2 = self.ws.init_project("inc_live_proj", self.root / "inc_live_proj")
+        live_v1 = proj2 / "audio" / "working" / "v001" / "audio_v001.rpp"
+        live_v1_orig = live_v1.read_text(encoding="utf-8")
+        session_state = {"active_rpp": str(live_v1)}
+        seen_actions: list[tuple[str, dict]] = []
+
+        def _write_state() -> None:
+            self.bridge.state_path.write_text(
+                json.dumps({
+                    "connected": True,
+                    "heartbeat": time.time(),
+                    "reaper_version": "7.34/win64",
+                    "active_rpp": session_state["active_rpp"],
+                    "dirty": False,
+                    "selected_tracks": 1,
+                }),
+                encoding="utf-8",
+            )
+
+        _write_state()
+        stop_evt = threading.Event()
+
+        def _mock_daemon() -> None:
+            while not stop_evt.is_set():
+                for f in sorted(self.bridge.inbox_dir.glob("*.json")):
+                    req = json.loads(f.read_text(encoding="utf-8"))
+                    f.unlink(missing_ok=True)
+                    action = req["action"]
+                    params = req.get("params") or {}
+                    seen_actions.append((action, params))
+                    if action == "save_project_as":
+                        out_p = Path(params["path"])
+                        out_p.parent.mkdir(parents=True, exist_ok=True)
+                        out_p.write_text(
+                            live_v1_orig.replace("</REAPER_PROJECT>", "") + "  ; increment saved live\n",
+                            encoding="utf-8",
+                        )
+                        session_state["active_rpp"] = str(out_p)
+                        _write_state()
+                        res = {
+                            "saved": True,
+                            "path": str(out_p),
+                            "active_rpp": str(out_p),
+                            "switched_in_place": True,
+                            "reloaded": False,
+                            "dirty": False,
+                        }
+                    else:
+                        res = {"ok": True}
+                    out_f = self.bridge.outbox_dir / f"{req['id']}.json"
+                    out_f.write_text(json.dumps({"id": req["id"], "ok": True, "result": res}), encoding="utf-8")
+                time.sleep(0.02)
+
+        t = threading.Thread(target=_mock_daemon, daemon=True)
+        t.start()
+        try:
+            # 2. GUI ObolMainWindow._action_reaper_increment_save -> v002 (keeps v002 open & active, no open_project reload)
+            win = ObolMainWindow(hub=self.hub, initial_project="inc_live_proj", initial_component="audio")
+            self.assertEqual(win.reaper_inc_save_btn.text(), "Increment Save (→ v002)")
+            bundle_v2 = win._action_reaper_increment_save(silent=True)
+            self.assertIsNotNone(bundle_v2)
+            assert bundle_v2 is not None
+            self.assertEqual(bundle_v2.version, 2)
+            live_v2 = proj2 / "audio" / "working" / "v002" / "audio_v002.rpp"
+            self.assertEqual(Path(session_state["active_rpp"]).resolve(), live_v2.resolve())
+            self.assertTrue(seen_actions[-1][1].get("ensure_open"))
+            self.assertEqual(win.working_list.topLevelItemCount(), 2)
+            self.assertEqual(win.reaper_inc_save_btn.text(), "Increment Save (→ v003)")
+            self.assertEqual(live_v1.read_text(encoding="utf-8"), live_v1_orig)
+            self.assertNotIn("open_project", [a for a, _ in seen_actions])
+            win.close()
+
+            # 3. CLI obol reaper increment-save -> v003 (continues from open v002, keeps v003 open)
+            self.assertEqual(
+                run_cli(["reaper", "increment-save", "-m", "CLI inc save", "--json"], hub=self.hub),
+                0,
+            )
+            live_v3 = proj2 / "audio" / "working" / "v003" / "audio_v003.rpp"
+            self.assertTrue(live_v3.is_file())
+            self.assertEqual(Path(session_state["active_rpp"]).resolve(), live_v3.resolve())
+            self.assertTrue(seen_actions[-1][1].get("ensure_open"))
+            self.assertNotIn("open_project", [a for a, _ in seen_actions])
+        finally:
+            stop_evt.set()
+            t.join(timeout=2.0)
+
+        # 4. CLI prepare-working + file write + register-working -> v004
+        self.assertEqual(
+            run_cli(["reaper", "prepare-working", "--rpp", str(live_v3), "--json"], hub=self.hub),
+            0,
+        )
+        live_v4 = proj2 / "audio" / "working" / "v004" / "audio_v004.rpp"
+        live_v4.write_text(live_v1_orig, encoding="utf-8")
+        self.assertEqual(
+            run_cli(
+                [
+                    "reaper",
+                    "register-working",
+                    "--rpp",
+                    str(live_v4),
+                    "--parent-version",
+                    "3",
+                    "-m",
+                    "Registered v4",
+                    "--json",
+                ],
+                hub=self.hub,
+            ),
+            0,
+        )
+        snap = self.ws.load_component_snapshot_safe(proj2, "audio") if hasattr(self.ws, "load_component_snapshot_safe") else None
+        from obol.core.storage import load_component_snapshot
+
+        snap_loaded = load_component_snapshot(proj2, "audio")
+        self.assertEqual([w.version for w in snap_loaded.working_versions], [1, 2, 3, 4])
+        del snap
 
 
 if __name__ == "__main__":

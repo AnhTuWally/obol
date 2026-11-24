@@ -7,7 +7,13 @@ import shutil
 from pathlib import Path
 from typing import Any, Optional
 
-from obol.core.models import FileTemplate, ProjectTemplate, TaskTemplate
+from obol.core.models import (
+    FileTemplate,
+    ProjectTemplate,
+    ResolvedSeedTemplate,
+    TaskTemplate,
+)
+from obol.core.seed_templates import SeedTemplateManager
 from obol.core.storage import (
     atomic_write_toml,
     discover_project_components,
@@ -36,6 +42,18 @@ DEFAULT_REAPER_RPP_CONTENT = """<REAPER_PROJECT 0.1 "7.0" 1732320000
 DEFAULT_NOTES_MD_CONTENT = """# Working Notes
 Created with Obol Pipeline.
 """
+
+DEFAULT_FILMCRAFT_FCPROJ_CONTENT = (
+    '{"format":"filmcraft.project","schema_version":17,"generator":"FilmCraft 0.20.1",'
+    '"project":{"name":"filmcraft_default","settings":{"renderer":"FilmCraft GPU Acceleration (wgpu)",'
+    '"video_display":"Timecode","audio_display_samples":true,"default_still_duration":1270080000000,'
+    '"default_transition_duration_frames":24,"default_audio_transition_duration":254016000000,'
+    '"ingest":{"enabled":false,"action":"createProxies","destination":null,"preset":""},'
+    '"title_safe":[20.0,20.0],"action_safe":[10.0,10.0],"capture_format":"DV",'
+    '"scratch":{"captured":null,"videoPreviews":null,"audioPreviews":null,"autoSave":null}},'
+    '"root":{"id":0,"name":"filmcraft_default","children":[]},"items":{},"next_id":1},'
+    '"view":{"open_sequences":[],"active_sequence":null,"sequences":{}}}\n'
+)
 
 
 def builtin_project_templates() -> dict[str, ProjectTemplate]:
@@ -133,6 +151,22 @@ def builtin_task_templates() -> dict[str, TaskTemplate]:
             extra_working_dirs=[],
             publish_formats=[".mp4", ".mov", ".wav", ".png"],
         ),
+        "filmcraft_video": TaskTemplate(
+            name="filmcraft_video",
+            description="FilmCraft NLE video editing with video, audio, stills, captions, and LUTs routing",
+            software="filmcraft",
+            seed_file_template="filmcraft_default.fcproj",
+            repo_routes={
+                "video": [".mp4", ".mov", ".mkv", ".mxf", ".avi", ".webm"],
+                "audio": [".wav", ".flac", ".mp3", ".aiff", ".aac", ".ogg"],
+                "stills": [".png", ".jpg", ".jpeg", ".exr", ".dpx", ".tif", ".tiff", ".bmp", ".tga"],
+                "captions": [".srt", ".vtt"],
+                "luts": [".cube", ".3dl"],
+                "references": [".pdf", ".txt", ".md"],
+            },
+            extra_working_dirs=[],
+            publish_formats=[".mp4", ".mov", ".wav", ".png", ".xml"],
+        ),
         "generic_media": TaskTemplate(
             name="generic_media",
             description="Generic media production component",
@@ -152,14 +186,43 @@ def builtin_task_templates() -> dict[str, TaskTemplate]:
 class TemplateManager:
     """Manages Tier-1 (Project), Tier-2 (Task/Component), and Tier-3 (Seed Working File) templates."""
 
-    def __init__(self, hub_dir: Path, vault_dir: Optional[Path] = None) -> None:
+    def __init__(
+        self,
+        hub_dir: Path,
+        vault_dir: Optional[Path] = None,
+        client_root: Optional[Path] = None,
+    ) -> None:
         self.hub_dir = hub_dir
-        self.vault_dir = vault_dir
+        self._vault_dir = vault_dir
+        self._client_root = client_root
         self.templates_root = hub_dir / "templates"
         self.projects_dir = self.templates_root / "projects"
         self.tasks_dir = self.templates_root / "tasks"
         self.files_dir = self.templates_root / "files"
+        self.seeds = SeedTemplateManager(
+            hub_dir=hub_dir,
+            vault_dir=vault_dir,
+            client_root=client_root,
+        )
         self.ensure_defaults()
+
+    @property
+    def vault_dir(self) -> Optional[Path]:
+        return self._vault_dir
+
+    @vault_dir.setter
+    def vault_dir(self, value: Optional[Path]) -> None:
+        self._vault_dir = value
+        self.seeds.vault_dir = value.resolve() if value else None
+
+    @property
+    def client_root(self) -> Optional[Path]:
+        return self._client_root
+
+    @client_root.setter
+    def client_root(self, value: Optional[Path]) -> None:
+        self._client_root = value
+        self.seeds.client_root = value.expanduser().resolve() if value else None
 
     def ensure_defaults(self) -> None:
         self.projects_dir.mkdir(parents=True, exist_ok=True)
@@ -191,6 +254,10 @@ class TemplateManager:
         kra_seed = self.files_dir / "canvas.kra"
         if not kra_seed.exists():
             kra_seed.write_bytes(b"KRITA-OBOL-SEED\n")
+
+        fc_seed = self.files_dir / "filmcraft_default.fcproj"
+        if not fc_seed.exists():
+            fc_seed.write_text(DEFAULT_FILMCRAFT_FCPROJ_CONTENT, encoding="utf-8")
 
     def list_project_templates(self) -> dict[str, ProjectTemplate]:
         res: dict[str, ProjectTemplate] = {}
@@ -245,6 +312,38 @@ class TemplateManager:
             return candidate
         return None
 
+    def resolve_seed_template(
+        self,
+        software: str,
+        project_root: Optional[Path] = None,
+        client_root: Optional[Path] = None,
+        task_template: Optional[TaskTemplate] = None,
+        seed_override: Optional[str] = None,
+    ) -> Optional[ResolvedSeedTemplate]:
+        """Resolves the active seed template via Project -> Client Root -> Global -> Legacy cascade."""
+        from obol.core.seed_templates import normalize_software_key
+
+        effective_task_template = task_template
+        if task_template is not None:
+            target_sw = normalize_software_key(software)
+            if normalize_software_key(task_template.software) != target_sw:
+                effective_task_template = next(
+                    (
+                        t
+                        for t in self.list_task_templates().values()
+                        if normalize_software_key(t.software) == target_sw and t.seed_file_template
+                    ),
+                    None,
+                )
+        return self.seeds.resolve_seed_template(
+            software=software,
+            project_root=project_root,
+            client_root=client_root,
+            task_template=effective_task_template,
+            seed_override=seed_override,
+            legacy_files_dir=self.files_dir,
+        )
+
     def save_project_template(self, pt: ProjectTemplate) -> Path:
         """Creates or updates a Tier-1 Project Hierarchy Template (.toml)."""
         dest = self.projects_dir / f"{pt.name}.toml"
@@ -291,6 +390,8 @@ class TemplateManager:
         custom_components: Optional[list[str]] = None,
         component_task_overrides: Optional[dict[str, str]] = None,
         component_seed_overrides: Optional[dict[str, str]] = None,
+        client_root: Optional[Path] = None,
+        project_root: Optional[Path] = None,
     ) -> dict[str, Any]:
         """Builds an interactive preview structure showing folders and seed v001 files before creation."""
         pt = self.get_project_template(project_template_name)
@@ -304,14 +405,37 @@ class TemplateManager:
                 tt = self.get_task_template(task_overrides[norm_c])
             else:
                 tt = self.resolve_task_template_for_component(pt, norm_c)
-            seed_file = seed_overrides.get(norm_c) or tt.seed_file_template
+            explicit_seed = seed_overrides.get(norm_c) or None
+            resolved = self.resolve_seed_template(
+                software=tt.software,
+                project_root=project_root,
+                client_root=client_root,
+                task_template=tt,
+                seed_override=explicit_seed,
+            )
+            seed_label = (
+                resolved.display_label()
+                if resolved is not None
+                else (explicit_seed or tt.seed_file_template or "(blank)")
+            )
+            seed_spec = resolved.reference_spec() if resolved is not None else (explicit_seed or tt.seed_file_template)
+            seed_scope = resolved.scope.value if resolved is not None else ""
             leaf = norm_c.split("/")[-1]
-            ext = Path(seed_file).suffix if seed_file else ".rpp"
+            if resolved is not None:
+                ext = resolved.primary_file.suffix
+            elif explicit_seed:
+                ext = Path(explicit_seed).suffix or ".rpp"
+            elif tt.seed_file_template:
+                ext = Path(tt.seed_file_template).suffix or ".rpp"
+            else:
+                ext = ".rpp"
             comp_details.append({
                 "component_path": norm_c,
                 "task_template": tt.name,
                 "software": tt.software,
-                "seed_file": seed_file,
+                "seed_file": seed_label,
+                "seed_spec": seed_spec,
+                "seed_scope": seed_scope,
                 "initial_working_file": f"{norm_c}/working/v001/{leaf}_v001{ext}",
                 "triad": [f"{norm_c}/working", f"{norm_c}/repo", f"{norm_c}/published"],
             })

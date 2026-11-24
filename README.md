@@ -18,24 +18,25 @@
 ### 3-Pane PySide6 Desktop GUI (`obol gui`)
 - Studio dark Fusion theme with custom SVG branch chevrons and packaged app icon (`src/obol/gui/assets/obol_icon.{ico,png}`).
 - Zero-project welcome screen, searchable hierarchical component tree, and tabbed Triad workspace (`Working`, `Repo Assets`, `Published`) featuring OS drag-and-drop/drag-out, tab-bar hover switching, and a `Fast Drop` toggle.
-- Context-aware Inspector & Actions pane, keyboard shortcuts (`Ctrl+N`, `Ctrl+Shift+N`, `Ctrl+U`, `Ctrl+I`, `Ctrl+P`, `Ctrl+S`, `F5`, `Delete`), and safe read-only-aware deletion across versions, named assets/deliverables, components, and projects.
-- Built-in dialogs for New Project Wizard (with live folder/seed preview), 3-Tier Template Manager, Software Profiles, Projects & Vault Manager, Credits Report (Markdown copy & CSV export), and the Unified DCC Integrations Manager.
+- Context-aware Inspector & Actions pane, keyboard shortcuts (`Ctrl+N`, `Ctrl+Shift+N`, `Ctrl+U`, `Ctrl+I`, `Ctrl+P`, `Ctrl+S`, `Ctrl+Shift+S`, `F5`, `Delete`), and safe read-only-aware deletion across versions, named assets/deliverables, components, and projects.
+- Built-in dialogs for New Project Wizard (with live folder/seed preview), 3-Tier Template & Scoped Seed Manager, Software Profiles, Projects & Vault Manager, Credits Report (Markdown copy & CSV export), and the Unified DCC Integrations Manager.
 
 ### 3-Tier Composable Template Engine
 - **Tier 1 (Project Hierarchy)**: `simple_media`, `music_album`, `single_track`
-- **Tier 2 (Component / Task)**: `reaper_daw`, `resolve_video`, `blender_3d`, `krita_art`, `generic_media`
-- **Tier 3 (Working Seed Files)**: `reaper_default.rpp`, `blank.blend`, `canvas.kra`, `notes.md`
+- **Tier 2 (Component / Task)**: `reaper_daw`, `resolve_video`, `filmcraft_video`, `blender_3d`, `krita_art`, `generic_media`
+- **Tier 3 (Scoped & Versioned Software Seed Templates)**: Project → Client Workspace Root → Global resolution cascade with multiple named versioned seed streams (`v001/`, `v002/`, ...), `Always Latest` or pinned `vNNN` defaults, plus legacy flat starter seed files (`reaper_default.rpp`, `filmcraft_default.fcproj`, `blank.blend`, `canvas.kra`, `notes.md`).
 - Supports dry-run tree previews and capturing existing projects, components, or files into reusable templates.
 
 ### 2-Tier Software Profiles & DCC Integrations
 - Declarative `SoftwareProfile` entries supporting 4 `VersionUpStrategy` modes (`clone_primary_file`, `clone_entire_folder`, `copy_with_sidecars`, `from_seed_template`), ignore patterns, optional read-only locking of previous working versions, and dynamic user plugins loaded from `~/.obol/plugins/`.
-- **REAPER DAW**: Offline `.rpp` relative path patching (`RECORD_PATH`, `RENDER_FILE`), external media scanner & 1-click collector/relinker into `repo/`, 1-click Lua ReaScript installer (7 registered Actions, `Obol_Toolbar.ReaperMenu`, optional `__startup.lua` auto-bridge), atomic JSON IPC bridge, and focused companion dialogs (Open, Import/Update takes, Hybrid Direct/Native Render & Publish).
+- **REAPER DAW**: Offline `.rpp` relative path patching (`RECORD_PATH`, `RENDER_FILE`), external media scanner & 1-click collector/relinker into `repo/`, 1-click Lua ReaScript installer (9 registered Actions, `Obol_Toolbar.ReaperMenu`, optional `__startup.lua` auto-bridge), atomic JSON IPC bridge, **Increment Save** (`Ctrl+Shift+S` / `Obol: IncSave`, saving directly to `working/vNNN/` via `Main_SaveProjectEx` while keeping the new version active), **Session Media & MIDI Version Updater** (`P_EXT:OBOL_ASSET` take tracking, live or offline `.rpp` updates via in-place replacement or new A/B takes, and configurable MIDI handling), and focused companion dialogs (Open, Import/Update takes, Hybrid Direct/Native Render & Publish).
 - **DaVinci Resolve (Free & Studio)**: 1-click Lua menu script installer (`Utility/` and `Deliver/`), Media Pool import & clip version updating (`ReplaceClipPreserveSubClip`), Render Queue / Quick Export / Deliver staging / Still / `.drp` publishing, Studio Python API + optional Free live IPC bridge, and remembered Resolve-project-to-Obol-component bindings.
+- **FilmCraft NLE**: Dual-mode `.fcproj` JSON plugin + `filmcraft-cli` headless & token-authenticated `--control` live bridge integration, relative path external media scanning & 1-click collector/relinker into `repo/`, project media version updater (`media.replaceFootage`), preset/format sequence exports, still renders, and XML/FCPXML/EDL/OTIO/AAF/OMF interchange publishing.
 - **Blender 3D**: `.blend` plugin with automatic `.blend1`/`.blend2` backup tidying into `.backups/`.
 - **Unified DCC Integrations Manager**: Centralized health and config-drift diagnostics, 1-click install/update/uninstall, and connection testing via the GUI or `obol integrations`.
 
 ### Command-Line Interface (`obol`)
-Pure-Python `argparse` CLI covering `root`, `init`, `project`, `task`, `work`, `ingest`, `publish`, `credits`, `template`, `software`, `vault`, `push`, `archive`, `checkout`, `delete`, `reaper`, `resolve`, `integrations`, and `gui`.
+Pure-Python `argparse` CLI covering `root`, `init`, `project`, `task`, `work`, `ingest`, `publish`, `credits`, `template`, `seed`, `software`, `vault`, `push`, `archive`, `checkout`, `delete`, `reaper`, `resolve`, `filmcraft`, `integrations`, and `gui`.
 
 ---
 
@@ -65,7 +66,7 @@ $env:PYTHONPATH="src"; python -m obol.cli.main gui
 # Run CLI commands
 $env:PYTHONPATH="src"; python -m obol.cli.main --help
 
-# Run the automated unit test suite (37 tests across 12 modules; GUI tests run headless via QT_QPA_PLATFORM=offscreen)
+# Run the automated unit test suite (55 tests across 14 modules; GUI tests run headless via QT_QPA_PLATFORM=offscreen)
 $env:PYTHONPATH="src"; python -m unittest discover -s tests -v
 ```
 
@@ -77,7 +78,7 @@ Start with **[docs/INDEX.md](docs/INDEX.md)** for core invariants, the repositor
 
 - **[docs/INDEX.md](docs/INDEX.md)** — Onboarding guide, core invariants, repository file map, and development roadmap.
 - **[docs/ARCHITECTURE_AND_STORAGE.md](docs/ARCHITECTURE_AND_STORAGE.md)** — Arbitrary-depth Triad hierarchy, universal `v001/` version containers, TOML/JSONL schemas, CRC32 fault-isolated ledger, auto-compaction, self-healing reconciler, and disposable SQLite cache.
-- **[docs/TEMPLATES_AND_PLUGINS.md](docs/TEMPLATES_AND_PLUGINS.md)** — 3-Tier Composable Template Engine, 2-Tier Software Integration, the 4 `VersionUpStrategy` modes, REAPER `.rpp` & ReaScript bridge internals, DaVinci Resolve dual-mode integration, and guide for authoring new DCC plugins.
+- **[docs/TEMPLATES_AND_PLUGINS.md](docs/TEMPLATES_AND_PLUGINS.md)** — 3-Tier Composable Template Engine, Scoped & Versioned Software Seed Templates, 2-Tier Software Integration, the 4 `VersionUpStrategy` modes, REAPER `.rpp` & ReaScript bridge internals, DaVinci Resolve dual-mode integration, FilmCraft NLE dual-mode integration, and guide for authoring new DCC plugins.
 - **[docs/SERVER_CLIENT_SYNC.md](docs/SERVER_CLIENT_SYNC.md)** — Remembered Client Workspace Root, "Local-First, Vault-Ready" optional SMB/NAS Server Vault, and stateless path-based selective checkout/archival (`pull_paths` & `push_paths`).
 - **[docs/GUI_AND_CLI_GUIDE.md](docs/GUI_AND_CLI_GUIDE.md)** — 3-Pane PySide6 Desktop GUI architecture, dialogs, Fusion dark theme + SVG chevrons, headless Qt testing, and complete CLI reference.
 

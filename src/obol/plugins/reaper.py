@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from obol.core.storage import normalize_rel_path
 from obol.plugins.base import ExternalDependency, PluginAction, TaskContext, unlock_file_writable
@@ -71,7 +71,9 @@ class ReaperPlugin:
             if not found_record:
                 new_lines.insert(insert_idx, f'  RECORD_PATH "{record_path}" ""')
 
-        rpp_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        new_text = "\n".join(new_lines) + "\n"
+        if new_text != text:
+            rpp_file.write_text(new_text, encoding="utf-8")
 
     def inspect_dependencies(
         self,
@@ -156,6 +158,65 @@ class ReaperPlugin:
         return replaced_count
 
     @staticmethod
+    def find_outdated_rpp_references(
+        rpp_file: Path,
+        project_root: Path,
+        workspace: Any,
+    ) -> list[dict[str, Any]]:
+        """Scans FILE "..." references in a .rpp file and resolves Obol repo/published version status."""
+        results: list[dict[str, Any]] = []
+        if not rpp_file.is_file() or rpp_file.suffix.lower() != ".rpp":
+            return results
+
+        rpp_dir = rpp_file.parent.resolve()
+        seen_refs: set[str] = set()
+        for line in rpp_file.read_text(encoding="utf-8", errors="replace").splitlines():
+            m = FILE_REF_RE.match(line)
+            if not m:
+                continue
+            raw_ref = m.group(2)
+            if raw_ref in seen_refs:
+                continue
+            seen_refs.add(raw_ref)
+
+            ref_path = Path(raw_ref)
+            resolved = (rpp_dir / ref_path).resolve() if not ref_path.is_absolute() else ref_path.resolve()
+            info = workspace.find_newer_asset_version(project_root, resolved)
+            if info is None:
+                continue
+            entry = dict(info)
+            entry["raw_reference"] = raw_ref
+            entry["resolved_path"] = resolved
+            results.append(entry)
+        return results
+
+    @staticmethod
+    def update_rpp_references(
+        rpp_file: Path,
+        project_root: Path,
+        workspace: Any,
+        replacements: Optional[dict[str, Path]] = None,
+    ) -> dict[str, Any]:
+        """Relinks outdated FILE "..." references inside a .rpp file to newer (or specified) Obol versions."""
+        refs = ReaperPlugin.find_outdated_rpp_references(rpp_file, project_root, workspace)
+        if replacements is None:
+            relink_map: dict[str, Path] = {
+                str(r["raw_reference"]): Path(r["latest_file"])
+                for r in refs
+                if r.get("update_available")
+            }
+            updated_entries = [r for r in refs if r.get("update_available")]
+        else:
+            relink_map = {str(k): Path(v) for k, v in replacements.items()}
+            updated_entries = [r for r in refs if r.get("raw_reference") in relink_map]
+
+        updated_count = ReaperPlugin.relink_rpp_references(rpp_file, relink_map) if relink_map else 0
+        return {
+            "updated_count": updated_count,
+            "updated": updated_entries,
+        }
+
+    @staticmethod
     def tidy_workspace(version_dir: Path) -> int:
         """Moves stray .rpp-bak and .reapeaks files into working/vNNN/.backups/."""
         if not version_dir.is_dir():
@@ -175,9 +236,19 @@ class ReaperPlugin:
             PluginAction("open_in_reaper_tab", "Open in New REAPER Tab", "Open .rpp in a new REAPER project tab via bridge"),
             PluginAction("version_up_launch", "vUp + Launch", "Create next working version and launch"),
             PluginAction(
+                "increment_save_reaper",
+                "Increment Save in REAPER",
+                "Save the open REAPER session directly as the next working version without reloading",
+            ),
+            PluginAction(
                 "import_into_reaper",
                 "Import into REAPER",
                 "Insert selected repo/ or published/ media into the active REAPER session",
+            ),
+            PluginAction(
+                "update_reaper_media",
+                "Update REAPER Media / MIDI",
+                "Scan and update imported audio or MIDI in REAPER to newer versions",
             ),
             PluginAction(
                 "collect_media",

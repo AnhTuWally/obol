@@ -41,6 +41,7 @@ from obol.core.storage import discover_project_components, load_component_snapsh
 from obol.core.workspace import ObolWorkspace, WorkingFileContext
 from obol.gui.theme import apply_studio_dark_theme
 from obol.plugins.base import launch_file_with_profile
+from obol.plugins.reaper import ReaperPlugin
 from obol.plugins.reaper_bridge import (
     ReaperBridgeClient,
     detect_reaper_executable,
@@ -48,6 +49,7 @@ from obol.plugins.reaper_bridge import (
     parse_reaper_render_presets,
 )
 from obol.plugins.reaper_installer import ReaperInstaller
+from obol.plugins.reaper_scripts import OBOL_ACTION_SPECS
 
 
 def _repolish(widget: QWidget) -> None:
@@ -252,7 +254,7 @@ class ReaperOpenDialog(QDialog):
 
 
 class ReaperImportDialog(QDialog):
-    """Browse repo/ & published/ deliverables to import into REAPER, and update outdated takes in the active session."""
+    """Browse repo/ & published/ deliverables to import into REAPER, and update outdated MIDI/media takes in the active session."""
 
     def __init__(
         self,
@@ -261,18 +263,20 @@ class ReaperImportDialog(QDialog):
         workspace: ObolWorkspace,
         bridge: ReaperBridgeClient,
         active_rpp: str = "",
+        initial_tab: int = 0,
     ) -> None:
         super().__init__(parent)
         self.hub = hub
         self.workspace = workspace
         self.bridge = bridge
         self.active_rpp = active_rpp
+        self._offline_rpp_mode = False
         self._ctx: Optional[WorkingFileContext] = (
             self.workspace.resolve_working_file_context(Path(active_rpp)) if active_rpp else None
         )
 
-        self.setWindowTitle("Obol — Import & Update Assets in REAPER")
-        self.resize(860, 560)
+        self.setWindowTitle("Obol — Import && Update MIDI / Media in REAPER")
+        self.resize(940, 590)
 
         layout = QVBoxLayout(self)
 
@@ -346,26 +350,61 @@ class ReaperImportDialog(QDialog):
         tab_updates = QWidget()
         tu_layout = QVBoxLayout(tab_updates)
         tu_top = QHBoxLayout()
-        tu_top.addWidget(QLabel("Scan takes in the open REAPER session for newer repo/ or published/ versions:"))
+        tu_top.addWidget(QLabel("Scan MIDI (in-project or .mid) & media takes in REAPER for newer Obol versions:"))
         tu_top.addStretch()
         self.scan_btn = QPushButton("Scan Open REAPER Session")
-        self.scan_btn.clicked.connect(self.scan_session_updates)
+        self.scan_btn.clicked.connect(lambda: self.scan_session_updates(silent_if_offline=False))
         tu_top.addWidget(self.scan_btn)
         tu_layout.addLayout(tu_top)
 
-        self.updates_table = QTableWidget(0, 6)
-        self.updates_table.setHorizontalHeaderLabels(["Update", "Track", "Obol Asset", "Current", "Latest", "Status"])
+        self.updates_summary_label = QLabel("")
+        self.updates_summary_label.setObjectName("MutedText")
+        tu_layout.addWidget(self.updates_summary_label)
+
+        self.updates_table = QTableWidget(0, 8)
+        self.updates_table.setHorizontalHeaderLabels(
+            ["Update", "Track / Take", "Type", "Obol Asset", "Current", "Target Version", "Status", "Match"]
+        )
         self.updates_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        self.updates_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.updates_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self.updates_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.updates_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.updates_table.setColumnWidth(1, 160)
+        self.updates_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.updates_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.updates_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.updates_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.updates_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        self.updates_table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
         tu_layout.addWidget(self.updates_table, 1)
 
+        opts_row = QHBoxLayout()
+        opts_row.addWidget(QLabel("Update Mode:"))
+        self.update_mode_combo = QComboBox()
+        self.update_mode_combo.addItem("Replace Take Source (In-Place)", "replace_source")
+        self.update_mode_combo.addItem("Add as New Active Take (A/B Compare)", "add_take")
+        opts_row.addWidget(self.update_mode_combo)
+
+        opts_row.addWidget(QLabel("MIDI Storage:"))
+        self.midi_mode_combo = QComboBox()
+        self.midi_mode_combo.addItem("Preserve MIDI Mode (In-Project / File Ref)", "preserve")
+        self.midi_mode_combo.addItem("Convert to In-Project MIDI", "in_project")
+        self.midi_mode_combo.addItem("Link as External .mid File", "file_ref")
+        opts_row.addWidget(self.midi_mode_combo)
+
+        self.match_length_chk = QCheckBox("Auto-resize untrimmed items to new file length")
+        self.match_length_chk.setChecked(True)
+        opts_row.addWidget(self.match_length_chk)
+        opts_row.addStretch()
+        tu_layout.addLayout(opts_row)
+
         tu_btns = QHBoxLayout()
+        self.select_outdated_btn = QPushButton("Select Outdated")
+        self.select_outdated_btn.clicked.connect(lambda: self._set_updates_selection(outdated_only=True))
+        self.select_none_btn = QPushButton("Select None")
+        self.select_none_btn.clicked.connect(lambda: self._set_updates_selection(outdated_only=False))
+        tu_btns.addWidget(self.select_outdated_btn)
+        tu_btns.addWidget(self.select_none_btn)
         tu_btns.addStretch()
-        self.apply_updates_btn = QPushButton("Update Selected to Latest")
+        self.apply_updates_btn = QPushButton("Update Selected")
         self.apply_updates_btn.setObjectName("PrimaryButton")
         self.apply_updates_btn.clicked.connect(self._on_apply_updates)
         tu_btns.addWidget(self.apply_updates_btn)
@@ -393,7 +432,13 @@ class ReaperImportDialog(QDialog):
         self.project_combo.currentIndexChanged.connect(self._populate_asset_tree)
         self.scope_combo.currentIndexChanged.connect(self._populate_asset_tree)
         self.search_edit.textChanged.connect(self._populate_asset_tree)
+        self.tabs.currentChanged.connect(self._on_tab_changed)
         self._populate_asset_tree()
+
+        if 0 <= initial_tab < self.tabs.count():
+            self.tabs.setCurrentIndex(initial_tab)
+        if initial_tab == 1:
+            self.scan_session_updates(silent_if_offline=True)
 
     def _refresh_bridge_pill(self) -> None:
         st = self.bridge.get_state()
@@ -464,18 +509,24 @@ class ReaperImportDialog(QDialog):
         entries = [it.data(0, Qt.ItemDataRole.UserRole) for it in selected if it.data(0, Qt.ItemDataRole.UserRole)]
         paths = [Path(e["file_path"]) for e in entries]
         mode = str(self.insert_mode_combo.currentData() or "new_track")
-        meta = (
+        raw_root = self.project_combo.currentData()
+        proj_root_str = str(Path(str(raw_root)).resolve()) if raw_root else ""
+        metas = [
             {
-                "scope": entries[0]["scope"],
-                "component": entries[0]["component"],
-                "asset_key": entries[0]["asset_key"],
-                "version": entries[0]["version"],
+                "project_root": proj_root_str,
+                "scope": e["scope"],
+                "component": e["component"],
+                "asset_key": e["asset_key"],
+                "version": e["version"],
+                "file_path": str(Path(e["file_path"]).resolve()),
+                "file_name": e["file_name"],
+                "media_kind": "midi" if Path(str(e["file_path"])).suffix.lower() in (".mid", ".midi") else "media",
             }
-            if len(entries) == 1
-            else {}
-        )
+            for e in entries
+        ]
+        meta = metas[0] if len(metas) == 1 else {}
         try:
-            res = self.bridge.insert_media(paths, mode=mode, asset_meta=meta)
+            res = self.bridge.insert_media(paths, mode=mode, asset_meta=meta, asset_metas=metas)
             QMessageBox.information(
                 self,
                 "Imported into REAPER",
@@ -484,78 +535,285 @@ class ReaperImportDialog(QDialog):
         except Exception as exc:
             QMessageBox.warning(self, "Import Failed", str(exc))
 
-    def scan_session_updates(self) -> None:
-        self._refresh_bridge_pill()
-        if not self.bridge.is_connected():
-            QMessageBox.warning(self, "REAPER Bridge Offline", "Open REAPER with Obol Bridge active to scan the session.")
+    def _on_tab_changed(self, idx: int) -> None:
+        if idx == 1:
+            self.scan_session_updates(silent_if_offline=True)
+
+    def _set_updates_selection(self, outdated_only: bool) -> None:
+        for row in range(self.updates_table.rowCount()):
+            chk = self.updates_table.item(row, 0)
+            if chk is None:
+                continue
+            info = chk.data(Qt.ItemDataRole.UserRole)
+            combo = self.updates_table.cellWidget(row, 5)
+            target_ver = combo.currentData() if isinstance(combo, QComboBox) else None
+            if outdated_only and isinstance(target_ver, dict) and info:
+                differs = int(target_ver["version"]) != int(info["current_version"])
+                chk.setCheckState(Qt.CheckState.Checked if differs else Qt.CheckState.Unchecked)
+            else:
+                chk.setCheckState(Qt.CheckState.Unchecked)
+
+    def _on_target_version_changed(self, row_idx: int) -> None:
+        chk = self.updates_table.item(row_idx, 0)
+        combo = self.updates_table.cellWidget(row_idx, 5)
+        status_it = self.updates_table.item(row_idx, 6)
+        if not chk or not isinstance(combo, QComboBox) or not status_it:
             return
+        info = chk.data(Qt.ItemDataRole.UserRole)
+        ver_entry = combo.currentData()
+        if not isinstance(info, dict) or not isinstance(ver_entry, dict):
+            return
+        curr_v = int(info["current_version"])
+        targ_v = int(ver_entry["version"])
+        if targ_v > curr_v:
+            status_it.setText(f"Upgrade → v{targ_v:03d}")
+            status_it.setForeground(QColor("#fbbf24"))
+            chk.setCheckState(Qt.CheckState.Checked)
+        elif targ_v < curr_v:
+            status_it.setText(f"Switch → v{targ_v:03d}")
+            status_it.setForeground(QColor("#60a5fa"))
+            chk.setCheckState(Qt.CheckState.Checked)
+        else:
+            status_it.setText("Up to Date")
+            status_it.setForeground(QColor("#4ade80"))
+            chk.setCheckState(Qt.CheckState.Unchecked)
+
+    def _populate_updates_row(self, info: dict[str, Any], offline: bool = False) -> None:
+        row_idx = self.updates_table.rowCount()
+        self.updates_table.insertRow(row_idx)
+
+        chk = QTableWidgetItem()
+        chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+        chk.setCheckState(Qt.CheckState.Checked if info.get("update_available") else Qt.CheckState.Unchecked)
+        chk.setData(Qt.ItemDataRole.UserRole, info)
+
+        track_name = str(info.get("track_name") or "").strip()
+        take_name = str(info.get("take_name") or "").strip()
+        if offline:
+            track_txt = Path(str(info.get("raw_reference") or info.get("current_file") or "")).name
+        elif track_name and take_name:
+            track_txt = f"{track_name} / {take_name}"
+        else:
+            track_txt = track_name or take_name or "—"
+
+        is_midi = bool(info.get("is_midi")) or str(info.get("media_kind")) == "midi"
+        if is_midi:
+            storage = str(info.get("midi_storage") or ("file_ref" if offline else ""))
+            if storage == "in_project":
+                type_txt = "MIDI (in-proj)"
+            elif storage == "file_ref":
+                type_txt = "MIDI (.mid)"
+            else:
+                type_txt = "MIDI"
+        else:
+            type_txt = "Media"
+
+        asset_it = QTableWidgetItem(f"{info['component']} / {info['kind']} / {info['asset_key']}")
+        curr_it = QTableWidgetItem(f"v{int(info['current_version']):03d}")
+
+        ver_combo = QComboBox()
+        versions = list(info.get("available_versions") or [])
+        if not versions:
+            versions = [
+                {
+                    "version": int(info["current_version"]),
+                    "version_label": f"v{int(info['current_version']):03d}",
+                    "file_path": info["current_file"],
+                    "file_name": Path(str(info["current_file"])).name,
+                    "is_latest": not info.get("update_available"),
+                }
+            ]
+            if info.get("update_available"):
+                versions.append({
+                    "version": int(info["latest_version"]),
+                    "version_label": f"v{int(info['latest_version']):03d}",
+                    "file_path": info["latest_file"],
+                    "file_name": Path(str(info["latest_file"])).name,
+                    "is_latest": True,
+                })
+
+        latest_idx = 0
+        for idx, v in enumerate(versions):
+            lbl = f"{v['version_label']}{' ★' if v.get('is_latest') else ''}"
+            ver_combo.addItem(lbl, v)
+            if int(v["version"]) == int(info["latest_version"]):
+                latest_idx = idx
+        ver_combo.setCurrentIndex(latest_idx)
+        ver_combo.currentIndexChanged.connect(lambda _idx, r=row_idx: self._on_target_version_changed(r))
+
+        if info.get("update_available"):
+            status_it = QTableWidgetItem(f"Upgrade → v{int(info['latest_version']):03d}")
+            status_it.setForeground(QColor("#fbbf24"))
+        else:
+            status_it = QTableWidgetItem("Up to Date")
+            status_it.setForeground(QColor("#4ade80"))
+
+        match_src = "offline .rpp" if offline else str(info.get("matched_by") or "file_path")
+
+        self.updates_table.setItem(row_idx, 0, chk)
+        self.updates_table.setItem(row_idx, 1, QTableWidgetItem(track_txt))
+        self.updates_table.setItem(row_idx, 2, QTableWidgetItem(type_txt))
+        self.updates_table.setItem(row_idx, 3, asset_it)
+        self.updates_table.setItem(row_idx, 4, curr_it)
+        self.updates_table.setCellWidget(row_idx, 5, ver_combo)
+        self.updates_table.setItem(row_idx, 6, status_it)
+        self.updates_table.setItem(row_idx, 7, QTableWidgetItem(match_src))
+
+    def scan_session_updates(self, silent_if_offline: bool = False) -> None:
+        self._refresh_bridge_pill()
         raw_root = self.project_combo.currentData()
         proot = self._ctx.project_root if self._ctx else (Path(str(raw_root)) if raw_root else None)
-        if not proot or not proot.is_dir():
+
+        self.updates_table.setRowCount(0)
+        self._offline_rpp_mode = False
+
+        if not self.bridge.is_connected():
+            rpp_cand = Path(self.active_rpp) if self.active_rpp else None
+            if rpp_cand and rpp_cand.is_file() and rpp_cand.suffix.lower() == ".rpp" and proot and proot.is_dir():
+                self._offline_rpp_mode = True
+                refs = ReaperPlugin.find_outdated_rpp_references(rpp_cand, proot, self.workspace)
+                for ref in refs:
+                    self._populate_updates_row(ref, offline=True)
+                outdated_cnt = sum(1 for r in refs if r.get("update_available"))
+                self.updates_summary_label.setText(
+                    f"Offline .rpp scan ({rpp_cand.name}): {len(refs)} Obol-tracked reference(s), {outdated_cnt} update(s) available."
+                )
+                return
+
+            self.updates_summary_label.setText(
+                "REAPER Bridge offline — start REAPER (with Obol Bridge) or open a working .rpp to scan."
+            )
+            if not silent_if_offline:
+                QMessageBox.warning(self, "REAPER Bridge Offline", "Open REAPER with Obol Bridge active to scan the session.")
             return
 
         try:
             session_items = self.bridge.query_session_media()
         except Exception as exc:
-            QMessageBox.warning(self, "Scan Failed", str(exc))
+            if not silent_if_offline:
+                QMessageBox.warning(self, "Scan Failed", str(exc))
+            self.updates_summary_label.setText(f"Scan failed: {exc}")
             return
 
-        self.updates_table.setRowCount(0)
-        seen_paths: set[str] = set()
+        matched_rows: list[dict[str, Any]] = []
+        seen_takes: set[tuple[str, str]] = set()
         for sit in session_items:
-            fpath_str = str(sit.get("file_path", ""))
-            if not fpath_str or fpath_str in seen_paths:
-                continue
-            info = self.workspace.find_newer_asset_version(proot, Path(fpath_str))
+            info = self.workspace.resolve_reaper_session_item(proot, sit)
             if info is None:
                 continue
-            seen_paths.add(fpath_str)
-            row_idx = self.updates_table.rowCount()
-            self.updates_table.insertRow(row_idx)
+            take_key = str(info.get("take_guid") or f"{info.get('item_idx')}:{info.get('take_idx')}")
+            dedup_key = (take_key, str(info.get("current_file") or ""))
+            if dedup_key in seen_takes:
+                continue
+            seen_takes.add(dedup_key)
+            matched_rows.append(info)
+            self._populate_updates_row(info, offline=False)
 
-            chk = QTableWidgetItem()
-            chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
-            chk.setCheckState(Qt.CheckState.Checked if info["update_available"] else Qt.CheckState.Unchecked)
-            chk.setData(Qt.ItemDataRole.UserRole, info)
-
-            track_it = QTableWidgetItem(str(sit.get("track_name", "") or "—"))
-            asset_it = QTableWidgetItem(f"{info['component']} / {info['kind']} / {info['asset_key']}")
-            curr_it = QTableWidgetItem(f"v{info['current_version']:03d}")
-            lat_it = QTableWidgetItem(f"v{info['latest_version']:03d}")
-            status_it = QTableWidgetItem("Update Available" if info["update_available"] else "Up to Date")
-            if info["update_available"]:
-                status_it.setForeground(QColor("#fbbf24"))
-            else:
-                status_it.setForeground(QColor("#4ade80"))
-
-            self.updates_table.setItem(row_idx, 0, chk)
-            self.updates_table.setItem(row_idx, 1, track_it)
-            self.updates_table.setItem(row_idx, 2, asset_it)
-            self.updates_table.setItem(row_idx, 3, curr_it)
-            self.updates_table.setItem(row_idx, 4, lat_it)
-            self.updates_table.setItem(row_idx, 5, status_it)
+        midi_cnt = sum(1 for r in matched_rows if r.get("is_midi"))
+        media_cnt = len(matched_rows) - midi_cnt
+        outdated_cnt = sum(1 for r in matched_rows if r.get("update_available"))
+        self.updates_summary_label.setText(
+            f"Scanned {len(session_items)} session take(s): matched {len(matched_rows)} Obol asset(s) "
+            f"({midi_cnt} MIDI, {media_cnt} media), {outdated_cnt} update(s) available."
+        )
 
     def _on_apply_updates(self) -> None:
-        replacements: dict[str, str] = {}
+        raw_root = self.project_combo.currentData()
+        proot = self._ctx.project_root if self._ctx else (Path(str(raw_root)) if raw_root else None)
+
+        offline_replacements: dict[str, Path] = {}
+        take_updates: list[dict[str, Any]] = []
+        legacy_replacements: dict[str, str] = {}
+
         for row in range(self.updates_table.rowCount()):
             chk = self.updates_table.item(row, 0)
-            if chk and chk.checkState() == Qt.CheckState.Checked:
-                info = chk.data(Qt.ItemDataRole.UserRole)
-                if info and info.get("update_available"):
-                    replacements[str(info["current_file"])] = str(info["latest_file"])
+            if not chk or chk.checkState() != Qt.CheckState.Checked:
+                continue
+            info = chk.data(Qt.ItemDataRole.UserRole)
+            if not isinstance(info, dict):
+                continue
+            combo = self.updates_table.cellWidget(row, 5)
+            ver_entry = combo.currentData() if isinstance(combo, QComboBox) else None
+            if isinstance(ver_entry, dict):
+                target_file = Path(str(ver_entry["file_path"]))
+                target_ver = int(ver_entry["version"])
+            else:
+                target_file = Path(str(info["latest_file"]))
+                target_ver = int(info["latest_version"])
 
-        if not replacements:
-            QMessageBox.information(self, "Session Asset Updates", "No outdated items are checked for update.")
+            curr_file = Path(str(info["current_file"]))
+            if target_ver == int(info["current_version"]) and target_file == curr_file:
+                continue
+
+            if self._offline_rpp_mode and not self.bridge.is_connected():
+                raw_ref = str(info.get("raw_reference") or "")
+                if raw_ref:
+                    offline_replacements[raw_ref] = target_file
+            else:
+                legacy_replacements[str(curr_file)] = str(target_file)
+                new_meta = {
+                    "project_root": str(proot.resolve()) if proot else str((info.get("obol_ext") or {}).get("project_root") or ""),
+                    "scope": str(info["kind"]),
+                    "component": str(info["component"]),
+                    "asset_key": str(info["asset_key"]),
+                    "version": target_ver,
+                    "file_path": str(target_file.resolve()),
+                    "file_name": target_file.name,
+                    "media_kind": str(info.get("media_kind") or ("midi" if target_file.suffix.lower() in (".mid", ".midi") else "media")),
+                }
+                take_updates.append({
+                    "take_guid": str(info.get("take_guid") or ""),
+                    "item_guid": str(info.get("item_guid") or ""),
+                    "old_path": str(curr_file),
+                    "target_path": str(target_file),
+                    "asset_meta": new_meta,
+                })
+
+        if self._offline_rpp_mode and not self.bridge.is_connected():
+            if not offline_replacements:
+                QMessageBox.information(self, "Session Asset Updates", "No outdated items are checked for update.")
+                return
+            if not proot or not self.active_rpp:
+                return
+            try:
+                res = ReaperPlugin.update_rpp_references(
+                    Path(self.active_rpp), proot, self.workspace, replacements=offline_replacements
+                )
+                QMessageBox.information(
+                    self,
+                    "Updated .rpp References",
+                    f"Relinked {res.get('updated_count', 0)} reference(s) in {Path(self.active_rpp).name}.",
+                )
+                self.scan_session_updates(silent_if_offline=True)
+            except Exception as exc:
+                QMessageBox.warning(self, "Update Failed", str(exc))
             return
 
+        if not take_updates:
+            QMessageBox.information(self, "Session Asset Updates", "No items with a changed target version are checked.")
+            return
+
+        update_mode = str(self.update_mode_combo.currentData() or "replace_source")
+        midi_mode = str(self.midi_mode_combo.currentData() or "preserve")
+        match_length = "auto" if self.match_length_chk.isChecked() else "never"
+
         try:
-            res = self.bridge.update_media_sources(replacements)
+            res = self.bridge.update_media_sources(
+                replacements=legacy_replacements,
+                take_updates=take_updates,
+                update_mode=update_mode,
+                midi_mode=midi_mode,
+                match_length=match_length,
+            )
+            midi_upd = int(res.get("updated_midi_takes", 0))
+            media_upd = int(res.get("updated_media_takes", 0))
+            detail = f" ({midi_upd} MIDI, {media_upd} media)" if (midi_upd or media_upd) else ""
             QMessageBox.information(
                 self,
                 "Updated REAPER Takes",
-                f"Updated {res.get('updated_takes', 0)} take(s) across {res.get('updated_items', 0)} media item(s).",
+                f"Updated {res.get('updated_takes', 0)} take(s){detail} across {res.get('updated_items', 0)} media item(s).",
             )
-            self.scan_session_updates()
+            self.scan_session_updates(silent_if_offline=True)
         except Exception as exc:
             QMessageBox.warning(self, "Update Failed", str(exc))
 
@@ -1053,7 +1311,7 @@ class ReaperIntegrationDialog(QDialog):
             else ""
         )
         self.details_label.setText(
-            f"Installed Scripts: {len(st['scripts_installed'])} / 7\n"
+            f"Installed Scripts: {len(st['scripts_installed'])} / {len(OBOL_ACTION_SPECS)}\n"
             f"Registered Actions (reaper-kb.ini): {len(st['actions_registered'])}\n"
             f"Startup Auto-Bridge: {'Enabled' if st['startup_hook_installed'] else 'Disabled'}\n"
             f"Active .rpp: {st['active_rpp'] or 'None'}"
@@ -1110,7 +1368,9 @@ def launch_reaper_dialog(
     if mode == "open":
         dlg: QDialog = ReaperOpenDialog(None, hub, workspace, bridge, active_rpp=active_rpp)
     elif mode == "import":
-        dlg = ReaperImportDialog(None, hub, workspace, bridge, active_rpp=active_rpp)
+        dlg = ReaperImportDialog(None, hub, workspace, bridge, active_rpp=active_rpp, initial_tab=0)
+    elif mode == "update":
+        dlg = ReaperImportDialog(None, hub, workspace, bridge, active_rpp=active_rpp, initial_tab=1)
     elif mode == "publish":
         dlg = ReaperExportPublishDialog(
             None,

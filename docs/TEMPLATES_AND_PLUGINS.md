@@ -48,9 +48,26 @@ Defines how a single `{working, repo, published}` component behaves:
 - `repo_routes`: Maps file extensions to category prefixes inside `repo/` for automatic ingestion routing (e.g., `.wav` $\rightarrow$ `repo/audio/<asset_name>/v001/`).
 - `publish_formats`: List of expected deliverable extensions surfaced as status chips in `PublishDeliverableDialog` (e.g., `reaper_daw` defaults to `[".wav", ".mid", ".mp3", ".flac"]`).
 
-### Tier 3: Working Seed File Templates (`FileTemplate`)
-Actual starter project files stored in `~/.obol/templates/files/`.
-- When a component is created with `seed_initial_working=True`, Obol copies the seed file into `working/v001/<component_leaf>_v001.<ext>` and runs the bound plugin's `on_version_created()` hook.
+### Tier 3: Scoped & Versioned Software Seed Templates (`SeedTemplateManager`)
+Initial working files can be managed per **Project**, per **Client Workspace Root**, and **Globally** with full `v001/`, `v002/`, ... version history and default version pinning (`src/obol/core/seed_templates.py`):
+
+```text
+<project_root>/.obol/templates/seeds/   # Scope 1: Project-level overrides
+<client_root>/.obol/templates/seeds/    # Scope 2: Client Workspace Root defaults
+~/.obol/templates/seeds/                # Scope 3: Global versioned seeds (mirrored to Vault)
+└── <software_key>/                     # e.g., reaper, blender, resolve, krita
+    ├── manifest.toml                   # default_template + per-stream default_version (0=latest, N=pinned)
+    ├── default/
+    │   ├── v001/default_v001.rpp
+    │   └── v002/default_v002.rpp
+    └── podcast_mix/
+        └── v001/podcast_mix_v001.rpp
+```
+
+- **3-Level Cascade**: When creating a component or versioning up with `FROM_SEED_TEMPLATE`, Obol resolves **Explicit Override** $\rightarrow$ **Project Override** $\rightarrow$ **Client Workspace Root Default** $\rightarrow$ **Global Versioned Default** $\rightarrow$ **Legacy `~/.obol/templates/files/`**.
+- **Multiple Named Streams & Version Pinning**: Each software in a scope can have multiple named templates (`default`, `podcast_mix`, etc.), select a `default_template` (or leave unset to inherit from parent scope), and set `default_version` to `0` (**Always Latest**) or pin a specific `vNNN`.
+- **Legacy Flat Files (`FileTemplate`)**: Starter files in `~/.obol/templates/files/` remain supported as the global fallback.
+- When a component is created with `seed_initial_working=True`, Obol copies the resolved seed version into `working/v001/<component_leaf>_v001.<ext>` and runs the bound plugin's `on_version_created()` hook (e.g., `ReaperPlugin` automatically patches `RECORD_PATH` and `RENDER_FILE`).
 
 ### Template CRUD & Capture API
 `TemplateManager` provides:
@@ -148,11 +165,19 @@ Obol pairs offline `.rpp` intelligence with a **zero-dependency Lua ReaScript + 
 
 - **1-Click Installer (`ReaperInstaller` / `obol reaper install`)**:
   - Auto-detects REAPER's resource directory (`%APPDATA%\REAPER`) and executable (`reaper.exe`).
-  - Installs pure-Lua scripts into `Scripts/Obol/` (`obol_config.lua`, `obol_lib.lua`, `obol_bridge.lua`, plus 7 REAPER Actions: Open Working File, Save & Version Up, Import Asset, Export & Publish, Collect External Media, Open Obol Studio, and Toggle Bridge).
+  - Installs pure-Lua scripts into `Scripts/Obol/` (`obol_config.lua`, `obol_lib.lua`, `obol_bridge.lua`, plus 9 REAPER Actions: Open Working File, Increment Save, Save & Version Up, Import Asset, Update Session Media, Export & Publish, Collect External Media, Open Obol Studio, and Toggle Bridge).
   - Backs up `reaper-kb.ini` → `reaper-kb.ini.obol.bak` before registering deterministic `SCR` actions, optionally adds a fenced auto-start hook to `Scripts/__startup.lua`, and exports an importable `MenuSets/Obol_Toolbar.ReaperMenu` toolbar.
 - **IPC Bridge (`ReaperBridgeClient`)**:
   - `obol_bridge.lua` runs a throttled `reaper.defer()` loop (~150 ms polling) writing heartbeats + active `.rpp` state to `state.json` and dispatching commands from `inbox/*.json` to `outbox/*.json`:
-    - `open_project` (current tab or new project tab), `save_project`, `insert_media` (new track / cursor track / new take), `query_session_media`, `update_media_sources` (undoable `v001 → v002` take hot-swap + peak rebuild), `render_direct` (auto-close headless render `42230` with preset support from `reaper-render.ini`), and `open_render_dialog` (pre-filled native Render dialog `40015`).
+    - `open_project` (current tab or new project tab), `save_project`, `save_project_as` (`reaper.Main_SaveProjectEx(0, path, 8)` using REAPER's Save As active-filename flag `&8` — with automatic `Main_openProject` fallback on REAPER < 7.34 so the new version stays open for continued editing), `insert_media` (new track / cursor track / new take, tagging per-take `P_EXT:OBOL_ASSET` metadata for both media and in-project MIDI), `query_session_media` (enumerates audio/video file takes, `.mid` file references, and in-project MIDI takes), `update_media_sources` (supports `v001 → v002` in-place replacement or adding a new A/B take via `AddTakeToMediaItem`, preserving or converting in-project MIDI via action `40684`, auto-resizing untrimmed items, and rebuilding audio peaks), `render_direct` (auto-close headless render `42230` with preset support from `reaper-render.ini`), and `open_render_dialog` (pre-filled native Render dialog `40015`).
+- **Increment Save (Save As Next Version & Keep Open)**:
+  - From REAPER: run **Custom: Obol - Increment Save** (or the `Obol: IncSave` toolbar button) to immediately Save As `working/vNNN/<leaf>_vNNN.rpp` via `Main_SaveProjectEx(0, path, 8)` so the new version stays open and active for continued work without touching the previous version.
+  - From Obol GUI: click **Increment Save (→ vNNN)** (`Ctrl+Shift+S`) in the Inspector.
+  - From CLI: run `obol reaper increment-save [--rpp <path>] [-m <note>]` (or `prepare-working` + `register-working`).
+- **Updating Imported MIDI & Media**:
+  - From REAPER: run **Custom: Obol - Update Session Media** (or `Obol: Update` toolbar button).
+  - From Obol GUI: click **Update REAPER Media / MIDI...** in the Inspector, or right-click any `repo/` or `published/` version and choose **Update Existing in REAPER Session**.
+  - From CLI: run `obol reaper update-media [--rpp <path>] [--check] [--offline] [--mode replace_source|add_take] [--midi-mode preserve|in_project|file_ref]`.
 
 ---
 
@@ -166,3 +191,16 @@ Obol supports both **DaVinci Resolve Free** and **DaVinci Resolve Studio** via a
 - **Dual-Mode Bridge (`ResolveBridgeClient`)**:
   - **In-Resolve Menu Scripts (Free & Studio)**: Capture session context (active project, timeline, bins, Media Pool clips, render presets, Quick Export presets) into temporary JSON, launch Obol's PySide6 dialog synchronously, and execute Media Pool imports (`ImportMedia` / `AppendToTimeline`), version updates (`ReplaceClipPreserveSubClip`), or renders (`AddRenderJob` + `StartRendering`, `RenderWithQuickExport`, Deliver page staging, `ExportCurrentFrameAsStill`, `.drp` `ExportProject`) directly inside Resolve before syncing outputs into `published/<deliverable>/vNNN/`.
   - **Studio External API / Optional Live Bridge**: Connects directly via `DaVinciResolveScript` on Resolve Studio (or via the optional `Obol - Live Bridge.lua` atomic JSON IPC loop on Resolve Free) so Obol's main GUI can push `repo/` / `published/` clips straight into Resolve's Media Pool and trigger exports.
+
+---
+
+## 7. FilmCraft NLE Integration (`filmcraft.py`, `filmcraft_bridge.py`, `filmcraft_installer.py`)
+
+Obol integrates with **FilmCraft** (`.fcproj`) in dual mode — working both **headlessly** via `filmcraft-cli` and **live** via FilmCraft's built-in TCP JSON-lines control server (`filmcraft --control <port>`):
+
+- **`.fcproj` JSON Plugin (`FilmCraftPlugin`)**:
+  - Syncs `project.name` and `project.root.name` to the versioned `.fcproj` filename stem on `on_version_created()` and tidies stray `.fcproj-bak`/`.fcproj.tmp` backups into `.backups/`.
+  - Scans `project.items` for external `Media.media.File.path` / `ImageSequence` / `proxy` references, tracks in-repo usage (`used_by_working_versions`), and relinks collected media into `repo/` using clean relative paths (`../../repo/...`).
+- **Dual-Mode Bridge (`FilmCraftBridgeClient`) & Installer (`FilmCraftInstaller`)**:
+  - Auto-detects `filmcraft.exe`, `filmcraft-cli.exe`, and `%APPDATA%\FilmCraft`, writes `~/.obol/bridge/filmcraft/config.json` + a `--control` launcher script, and launches FilmCraft with `--control 47420` when opening `.fcproj` files from Obol.
+  - Supports bin creation (`file.newBin`), media import (`file.import` / `edit.pasteMedia`), footage version upgrades (`media.replaceFootage`), preset/format media exports (`export` / `file.exportMedia`), still frame renders (`render`), and XML/FCPXML/EDL/OTIO/AAF/OMF interchange exports (`file.exportInterchange`) directly into `published/<deliverable>/vNNN/`.

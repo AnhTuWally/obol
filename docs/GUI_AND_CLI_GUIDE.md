@@ -50,14 +50,15 @@ To keep day-to-day navigation effortless and clutter-free, the main window uses 
 
 ### B. Dialogs (`src/obol/gui/dialogs.py`)
 - **`AddComponentDialog` ("Add Triad Component")**:
-  - Path field (auto-prefixed when a group folder is selected), Component Template dropdown with live software/seed summary, optional Bound Software override, and initial `working/v001` seed toggle.
+  - Path field (auto-prefixed when a group folder is selected), Component Template dropdown with live software/seed summary, optional Bound Software override, **Initial Seed Template** selector (defaulting to `Auto` via Project $\rightarrow$ Root $\rightarrow$ Global cascade, or selecting any specific named template/version), and initial `working/v001` seed toggle.
 - **`NewProjectWizardDialog` ("Create New Project")**:
-  - Left side: Project Name, optional Project Code, Client Root Path picker (with live destination path preview and `"Remember as default Client Workspace Root"` checkbox), Tier-1 Project Template selector (with template description and inline `Configure Templates...` button), Tier-2 Component Template selector, Tier-3 Working Seed File selector, and custom component adder (`+ Add Component`, `Apply Template to Selected`, `Remove Selected`). Per-component overrides are persisted when creating the project.
+  - Left side: Project Name, optional Project Code, Client Root Path picker (with live destination path preview, `Root Seeds...` button, and `"Remember as default Client Workspace Root"` checkbox), Tier-1 Project Template selector (with template description and inline `Configure Templates...` button), Tier-2 Component Template selector, Tier-3 Working Seed selector (reactively updated for the selected Client Root), and custom component adder (`+ Add Component`, `Apply Template to Selected`, `Remove Selected`). Per-component overrides are persisted when creating the project.
   - Right side: Live interactive `QTreeWidget` preview of the folders and initial `v001` seed files that will be generated.
 - **`TemplateManagerDialog` ("3-Tier Template Manager")**:
   - **Tab 1 (`1. Project Hierarchy Templates`)**: Create, edit, delete, or capture (`Capture Active Project`) Tier-1 project templates.
   - **Tab 2 (`2. Component / Task Templates`)**: Create, edit, delete, or capture (`Capture Active Component`) Tier-2 component templates (bound software, default seed file, and `repo/` category routing rules).
-  - **Tab 3 (`3. Working Seed Files`)**: Import starter files (`.rpp`, `.blend`, `.kra`, etc.) from disk, launch a seed file directly in its associated app to edit its default setup, delete seed files, or open `~/.obol/templates/` in Explorer.
+  - **Tab 3 (`3. Software Seed Templates`)**: Scope-aware (`Client Workspace Root`, `Active Project`, `Global`) 3-pane manager for named, versioned per-software templates (`v001`, `v002`, ...), `Set Default` / `Inherit (Clear)`, `Default Version` selector (`Always Latest` vs `Pin vNNN`), `Version Up & Open`, `Open in App`, and `SaveSeedTemplateDialog`.
+  - **Tab 4 (`4. Legacy Seed Files`)**: Manage legacy flat seed files in `~/.obol/templates/files/` and migrate them into scoped, versioned seed templates.
 - **`ProjectAndVaultManagerDialog`**:
   - Manage the remembered **Client Root (Local)**, optional **Server Vault**, and registered projects (highlights the active `★` project, double-click to switch, 1-click `Open`, `Backup`, `Archive (Free Space)`, `Check Out`, safe `Remove...` offering `Unregister Only (Keep Files)` vs `Delete Files from Disk`, `+ New Project...`, and `Register Existing Project Folder...`).
 - **`SmartIngestDialog`**:
@@ -130,9 +131,15 @@ obol delete publish <deliverable_name> -t <component_path> [-v <ver_num>] [-p <p
 obol delete component <component_path> [-p <project>] [--keep-files]
 obol delete project <name_or_code> [--delete-files]
 
-# 3-Tier Templates & 2-Tier Software Profiles
+# 3-Tier Templates, Scoped Software Seeds & 2-Tier Software Profiles
 obol template list
 obol template capture <source_path> --name <template_name> --tier project|task|file
+obol seed list [--software reaper] [--scope client_root|project|global|all] [--root <dir>] [-p <project>] [--json]
+obol seed resolve <software> [--root <dir>] [-p <project>] [--override <spec>] [--json]
+obol seed add <source_path> --software reaper [--name default] [--scope client_root|project|global] [--root <dir>] [-p <project>] [--set-default] [--pin-version]
+obol seed version-up --software reaper [--name default] [--scope client_root|project|global] [--root <dir>] [-m "Note"] [--pin-version] [--open]
+obol seed set-default --software reaper [--name <tpl_name>] [--version <N|latest>] [--clear] [--scope client_root|project|global] [--root <dir>]
+obol seed delete --software reaper --name <tpl_name> [--version <N>] [--scope client_root|project|global] [--root <dir>]
 obol software list
 obol software set <key> --name "Display Name" --exe "C:\path\to\app.exe" --ext .ext --strategy clone_primary_file
 

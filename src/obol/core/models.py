@@ -153,6 +153,17 @@ def default_software_profiles() -> dict[str, SoftwareProfile]:
             lock_previous_versions=True,
             plugin="resolve",
         ),
+        "filmcraft": SoftwareProfile(
+            key="filmcraft",
+            display_name="FilmCraft",
+            executable="",
+            extensions=[".fcproj"],
+            launch_args=["{file}"],
+            version_up_strategy=VersionUpStrategy.CLONE_PRIMARY_FILE,
+            ignore_patterns=["*.fcproj-bak", "*.fcproj.tmp", "Recovery/**", ".backups/**"],
+            lock_previous_versions=True,
+            plugin="filmcraft",
+        ),
         "generic": SoftwareProfile(
             key="generic",
             display_name="Generic / OS Default",
@@ -628,4 +639,180 @@ class FileTemplate:
     extension: str
     path: str
     description: str = ""
+
+
+class TemplateScope(str, Enum):
+    PROJECT = "project"
+    CLIENT_ROOT = "client_root"
+    GLOBAL = "global"
+
+
+@dataclass
+class SeedTemplateVersion:
+    """Represents a single vNNN/ version of a named software seed template."""
+
+    version: int
+    folder_rel: str
+    primary_file: str
+    sha256: str = ""
+    size_bytes: int = 0
+    created_at: str = field(default_factory=utc_now_iso)
+    comment: str = ""
+    author: str = ""
+    source: str = ""
+    tags: list[str] = field(default_factory=list)
+
+    @property
+    def version_label(self) -> str:
+        return f"v{self.version:03d}"
+
+    def to_dict(self) -> dict[str, Any]:
+        return clean_for_toml({
+            "version": int(self.version),
+            "folder_rel": self.folder_rel,
+            "primary_file": self.primary_file,
+            "sha256": self.sha256,
+            "size_bytes": int(self.size_bytes),
+            "created_at": self.created_at,
+            "comment": self.comment,
+            "author": self.author,
+            "source": self.source,
+            "tags": self.tags,
+        })
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> SeedTemplateVersion:
+        return cls(
+            version=int(data["version"]),
+            folder_rel=str(data.get("folder_rel", "")),
+            primary_file=str(data.get("primary_file", "")),
+            sha256=str(data.get("sha256", "")),
+            size_bytes=int(data.get("size_bytes", 0)),
+            created_at=str(data.get("created_at", "")),
+            comment=str(data.get("comment", "")),
+            author=str(data.get("author", "")),
+            source=str(data.get("source", "")),
+            tags=list(data.get("tags", [])),
+        )
+
+
+@dataclass
+class SeedTemplateStream:
+    """Represents a named versioned seed template stream (e.g., 'default', 'podcast_mix') for one software."""
+
+    name: str
+    software: str
+    description: str = ""
+    default_version: int = 0  # 0 = Always Latest; >0 = pinned to vNNN
+    versions: list[SeedTemplateVersion] = field(default_factory=list)
+
+    def latest_version_number(self) -> int:
+        return max((v.version for v in self.versions), default=0)
+
+    def resolve_version(self, version: Optional[int] = None) -> Optional[SeedTemplateVersion]:
+        if not self.versions:
+            return None
+        sorted_vers = sorted(self.versions, key=lambda v: v.version)
+        if version is not None and version > 0:
+            return next((v for v in sorted_vers if v.version == version), None)
+        if self.default_version > 0:
+            pinned = next((v for v in sorted_vers if v.version == self.default_version), None)
+            if pinned is not None:
+                return pinned
+        return sorted_vers[-1]
+
+    def to_dict(self) -> dict[str, Any]:
+        sorted_vers = sorted(self.versions, key=lambda v: v.version)
+        return clean_for_toml({
+            "name": self.name,
+            "software": self.software,
+            "description": self.description,
+            "default_version": int(self.default_version),
+            "versions": [v.to_dict() for v in sorted_vers],
+        })
+
+    @classmethod
+    def from_dict(cls, name: str, software: str, data: dict[str, Any]) -> SeedTemplateStream:
+        versions = [SeedTemplateVersion.from_dict(v) for v in data.get("versions", []) if isinstance(v, dict)]
+        versions.sort(key=lambda v: v.version)
+        return cls(
+            name=str(data.get("name", name)),
+            software=str(data.get("software", software)),
+            description=str(data.get("description", "")),
+            default_version=int(data.get("default_version", 0)),
+            versions=versions,
+        )
+
+
+@dataclass
+class SoftwareSeedManifest:
+    """Manifest stored at <seeds_dir>/<software>/manifest.toml."""
+
+    software: str
+    schema_version: int = 1
+    default_template: str = ""  # "" = inherit from parent scope
+    templates: dict[str, SeedTemplateStream] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return clean_for_toml({
+            "software": self.software,
+            "schema_version": int(self.schema_version),
+            "default_template": self.default_template,
+            "templates": {k: v.to_dict() for k, v in sorted(self.templates.items())},
+        })
+
+    @classmethod
+    def from_dict(cls, software: str, data: dict[str, Any]) -> SoftwareSeedManifest:
+        sw = str(data.get("software", software))
+        raw_tpls = data.get("templates", {})
+        templates: dict[str, SeedTemplateStream] = {}
+        if isinstance(raw_tpls, dict):
+            for k, v in raw_tpls.items():
+                if isinstance(v, dict):
+                    templates[str(k)] = SeedTemplateStream.from_dict(str(k), sw, v)
+        return cls(
+            software=sw,
+            schema_version=int(data.get("schema_version", 1)),
+            default_template=str(data.get("default_template", "")),
+            templates=templates,
+        )
+
+
+@dataclass
+class ResolvedSeedTemplate:
+    """Resolved seed template reference returned by the Project -> Root -> Global cascade."""
+
+    scope: TemplateScope
+    scope_root: Path
+    software: str
+    template_name: str
+    version: int
+    primary_file: Path
+    version_dir: Optional[Path] = None
+    is_legacy: bool = False
+    is_pinned_version: bool = False
+    comment: str = ""
+
+    def stream_spec(self) -> str:
+        if self.is_legacy:
+            return self.template_name
+        return f"seed:{self.scope.value}:{self.software}:{self.template_name}"
+
+    def reference_spec(self) -> str:
+        if self.is_legacy:
+            return self.template_name
+        return f"seed:{self.scope.value}:{self.software}:{self.template_name}:v{self.version:03d}"
+
+    def display_label(self) -> str:
+        scope_map = {
+            TemplateScope.PROJECT: "Project",
+            TemplateScope.CLIENT_ROOT: "Root",
+            TemplateScope.GLOBAL: "Global",
+        }
+        scope_lbl = scope_map.get(self.scope, self.scope.value)
+        if self.is_legacy:
+            return f"[{scope_lbl}] {self.template_name}"
+        mode = "pinned" if self.is_pinned_version else "latest"
+        return f"[{scope_lbl}] {self.template_name} v{self.version:03d} ({mode})"
+
 

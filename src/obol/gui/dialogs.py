@@ -40,9 +40,11 @@ from obol.core.models import (
     PublishItem,
     SoftwareProfile,
     TaskTemplate,
+    TemplateScope,
     VaultStatus,
     VersionUpStrategy,
 )
+from obol.core.seed_templates import normalize_software_key, normalize_template_name
 from obol.core.sync import SyncEngine
 from obol.core.workspace import ObolWorkspace
 from obol.gui.drop_widgets import DropTableWidget, extract_local_drop_paths
@@ -372,8 +374,12 @@ class NewProjectWizardDialog(QDialog):
         self.root_dir_edit = QLineEdit(str(self.hub.get_client_root()))
         browse_root_btn = QPushButton("Browse...")
         browse_root_btn.clicked.connect(self._browse_client_root)
+        root_tpl_btn = QPushButton("Root Seeds...")
+        root_tpl_btn.setToolTip("Manage per-software seed templates for this Client Workspace Root")
+        root_tpl_btn.clicked.connect(self._open_root_seed_manager)
         root_row.addWidget(self.root_dir_edit, 1)
         root_row.addWidget(browse_root_btn)
+        root_row.addWidget(root_tpl_btn)
         self.remember_root_chk = QCheckBox("Remember as default Client Workspace Root")
         self.remember_root_chk.setChecked(True)
 
@@ -467,11 +473,19 @@ class NewProjectWizardDialog(QDialog):
         self.proj_tpl_combo.currentTextChanged.connect(self._reset_components_from_template)
         self.task_tpl_combo.currentTextChanged.connect(self._on_task_template_changed)
         self.name_edit.textChanged.connect(self._refresh_preview_tree)
-        self.root_dir_edit.textChanged.connect(self._refresh_target_caption)
+        self.root_dir_edit.textChanged.connect(self._on_root_dir_changed)
         self._on_task_template_changed(self.task_tpl_combo.currentText())
         self._reset_components_from_template()
         self.name_edit.setFocus()
         self.name_edit.selectAll()
+
+    def _current_client_root(self) -> Optional[Path]:
+        txt = self.root_dir_edit.text().strip()
+        return Path(txt) if txt else None
+
+    def _on_root_dir_changed(self) -> None:
+        self._refresh_seed_combo()
+        self._refresh_preview_tree()
 
     def _refresh_target_caption(self) -> None:
         pname = self.name_edit.text().strip() or "new_project"
@@ -479,12 +493,57 @@ class NewProjectWizardDialog(QDialog):
         dest = Path(root_txt) / pname if root_txt else Path(pname)
         self.target_path_label.setText(f"Will create: {dest}")
 
+    def _refresh_seed_combo(self) -> None:
+        curr_data = self.seed_tpl_combo.currentData()
+        tt_name = self.task_tpl_combo.currentText()
+        tt = self.hub.template_manager.get_task_template(tt_name) if tt_name else None
+        sw_key = tt.software if tt else "generic"
+        prof = self.hub.get_software_profile(sw_key)
+        croot = self._current_client_root()
+
+        self.seed_tpl_combo.blockSignals(True)
+        self.seed_tpl_combo.clear()
+        resolved_auto = self.hub.template_manager.resolve_seed_template(
+            software=sw_key,
+            client_root=croot,
+            task_template=tt,
+        )
+        auto_lbl = (
+            f"Auto — {resolved_auto.display_label()}"
+            if resolved_auto is not None
+            else "Auto — (Root / Global Default)"
+        )
+        self.seed_tpl_combo.addItem(auto_lbl, "")
+
+        avail = self.hub.template_manager.seeds.list_available_for_software(
+            sw_key,
+            client_root=croot,
+            legacy_files_dir=self.hub.template_manager.files_dir,
+            preferred_extensions=prof.extensions,
+        )
+        seen_specs: set[str] = set()
+        for r in avail:
+            spec = r.stream_spec()
+            if spec in seen_specs:
+                continue
+            seen_specs.add(spec)
+            self.seed_tpl_combo.addItem(r.display_label(), spec)
+
+        for fname in sorted(self.hub.template_manager.list_file_templates().keys()):
+            if fname not in seen_specs:
+                self.seed_tpl_combo.addItem(f"[Legacy] {fname}", fname)
+                seen_specs.add(fname)
+
+        if curr_data:
+            idx = self.seed_tpl_combo.findData(curr_data)
+            if idx >= 0:
+                self.seed_tpl_combo.setCurrentIndex(idx)
+        self.seed_tpl_combo.blockSignals(False)
+
     def _on_task_template_changed(self, task_tpl_name: str) -> None:
         if not task_tpl_name:
             return
-        tt = self.hub.template_manager.get_task_template(task_tpl_name)
-        if tt.seed_file_template and self.seed_tpl_combo.findText(tt.seed_file_template) >= 0:
-            self.seed_tpl_combo.setCurrentText(tt.seed_file_template)
+        self._refresh_seed_combo()
         self._refresh_preview_tree()
 
     def _reset_components_from_template(self) -> None:
@@ -500,7 +559,11 @@ class NewProjectWizardDialog(QDialog):
         if c and c not in self._active_components:
             self._active_components.append(c)
             self._comp_task_overrides[c] = self.task_tpl_combo.currentText()
-            self._comp_seed_overrides[c] = self.seed_tpl_combo.currentText()
+            seed_spec = str(self.seed_tpl_combo.currentData() or "").strip()
+            if seed_spec:
+                self._comp_seed_overrides[c] = seed_spec
+            else:
+                self._comp_seed_overrides.pop(c, None)
             self.custom_comp_edit.clear()
             self._refresh_preview_tree()
 
@@ -513,7 +576,11 @@ class NewProjectWizardDialog(QDialog):
             comp_path = item.parent().data(0, Qt.ItemDataRole.UserRole)
         if comp_path and comp_path in self._active_components:
             self._comp_task_overrides[comp_path] = self.task_tpl_combo.currentText()
-            self._comp_seed_overrides[comp_path] = self.seed_tpl_combo.currentText()
+            seed_spec = str(self.seed_tpl_combo.currentData() or "").strip()
+            if seed_spec:
+                self._comp_seed_overrides[comp_path] = seed_spec
+            else:
+                self._comp_seed_overrides.pop(comp_path, None)
             self._refresh_preview_tree()
 
     def _remove_selected_component(self) -> None:
@@ -539,6 +606,7 @@ class NewProjectWizardDialog(QDialog):
             custom_components=self._active_components,
             component_task_overrides=self._comp_task_overrides,
             component_seed_overrides=self._comp_seed_overrides,
+            client_root=self._current_client_root(),
         )
         root_item = QTreeWidgetItem(self.preview_tree, [f"{pname}/", f"Project ({preview['project_template']})"])
         for shared in preview["shared_folders"]:
@@ -563,12 +631,19 @@ class NewProjectWizardDialog(QDialog):
         if folder:
             self.root_dir_edit.setText(folder)
 
-    def _open_template_manager(self) -> None:
-        dlg = TemplateManagerDialog(self, self.hub)
+    def _open_root_seed_manager(self) -> None:
+        self._open_template_manager(initial_tab=2)
+
+    def _open_template_manager(self, initial_tab: int = 0) -> None:
+        dlg = TemplateManagerDialog(
+            self,
+            self.hub,
+            initial_tab=initial_tab,
+            initial_root=self._current_client_root(),
+        )
         dlg.exec()
         curr_pt = self.proj_tpl_combo.currentText()
         curr_tt = self.task_tpl_combo.currentText()
-        curr_ft = self.seed_tpl_combo.currentText()
         self.proj_tpl_combo.blockSignals(True)
         self.proj_tpl_combo.clear()
         for pt_name in self.hub.template_manager.list_project_templates().keys():
@@ -585,11 +660,7 @@ class NewProjectWizardDialog(QDialog):
             self.task_tpl_combo.setCurrentText(curr_tt)
         self.task_tpl_combo.blockSignals(False)
 
-        self.seed_tpl_combo.clear()
-        for ft_name in self.hub.template_manager.list_file_templates().keys():
-            self.seed_tpl_combo.addItem(ft_name)
-        if self.seed_tpl_combo.findText(curr_ft) >= 0:
-            self.seed_tpl_combo.setCurrentText(curr_ft)
+        self._refresh_seed_combo()
         self._reset_components_from_template()
 
     def _create_project(self) -> None:
@@ -629,12 +700,19 @@ class NewProjectWizardDialog(QDialog):
 class AddComponentDialog(QDialog):
     """Modal for creating a new Triad Component with template, software, and seed options."""
 
-    def __init__(self, parent: Optional[QWidget], hub: ObolHub, initial_prefix: str = "") -> None:
+    def __init__(
+        self,
+        parent: Optional[QWidget],
+        hub: ObolHub,
+        initial_prefix: str = "",
+        project_root: Optional[Path] = None,
+    ) -> None:
         super().__init__(parent)
         self.hub = hub
+        self.project_root = project_root
         self._software_touched = False
         self.setWindowTitle("Add Triad Component")
-        self.resize(480, 270)
+        self.resize(520, 310)
 
         layout = QVBoxLayout(self)
         form = QFormLayout()
@@ -658,6 +736,8 @@ class AddComponentDialog(QDialog):
             prof = self.hub.config.software[sw_key]
             self.software_combo.addItem(f"{prof.display_name} ({prof.key})", prof.key)
 
+        self.seed_combo = QComboBox()
+
         self.seed_chk = QCheckBox("Create initial working/v001 from template seed file")
         self.seed_chk.setChecked(True)
 
@@ -665,6 +745,7 @@ class AddComponentDialog(QDialog):
         form.addRow("Component Template:", self.task_tpl_combo)
         form.addRow("", self.tpl_summary_label)
         form.addRow("Bound Software:", self.software_combo)
+        form.addRow("Initial Seed Template:", self.seed_combo)
         form.addRow("", self.seed_chk)
         layout.addLayout(form)
 
@@ -682,6 +763,8 @@ class AddComponentDialog(QDialog):
 
         self.task_tpl_combo.currentTextChanged.connect(self._on_template_changed)
         self.software_combo.activated.connect(self._on_software_user_selected)
+        self.software_combo.currentIndexChanged.connect(self._refresh_seed_choices)
+        self.seed_chk.toggled.connect(self.seed_combo.setEnabled)
         self._on_template_changed(self.task_tpl_combo.currentText())
         self.path_edit.setFocus()
         self.path_edit.setCursorPosition(len(self.path_edit.text()))
@@ -693,13 +776,64 @@ class AddComponentDialog(QDialog):
         if not tpl_name:
             return
         tt = self.hub.template_manager.get_task_template(tpl_name)
-        seed_txt = tt.seed_file_template or "none"
-        desc = tt.description or "Component template"
-        self.tpl_summary_label.setText(f"{desc}  •  Seed: {seed_txt}")
         if not self._software_touched:
             idx = self.software_combo.findData(tt.software)
             if idx >= 0:
+                self.software_combo.blockSignals(True)
                 self.software_combo.setCurrentIndex(idx)
+                self.software_combo.blockSignals(False)
+        self._refresh_seed_choices()
+
+    def _refresh_seed_choices(self) -> None:
+        sw_key = str(self.software_combo.currentData() or "generic")
+        tt = self.hub.template_manager.get_task_template(self.task_tpl_combo.currentText())
+        prof = self.hub.get_software_profile(sw_key)
+        resolved_auto = self.hub.template_manager.resolve_seed_template(
+            software=sw_key,
+            project_root=self.project_root,
+            task_template=tt,
+        )
+        desc = tt.description or "Component template"
+        seed_txt = resolved_auto.display_label() if resolved_auto is not None else (tt.seed_file_template or "none")
+        self.tpl_summary_label.setText(f"{desc}  •  Active Seed: {seed_txt}")
+
+        prev_data = self.seed_combo.currentData()
+        self.seed_combo.blockSignals(True)
+        self.seed_combo.clear()
+        auto_label = f"Auto — {resolved_auto.display_label()}" if resolved_auto is not None else "Auto — (blank file)"
+        self.seed_combo.addItem(auto_label, "")
+
+        scope_names = {
+            TemplateScope.PROJECT: "Project",
+            TemplateScope.CLIENT_ROOT: "Root",
+            TemplateScope.GLOBAL: "Global",
+        }
+        avail = self.hub.template_manager.seeds.list_available_for_software(
+            sw_key,
+            project_root=self.project_root,
+            legacy_files_dir=self.hub.template_manager.files_dir,
+            preferred_extensions=prof.extensions,
+            include_all_versions=True,
+        )
+        seen_specs: set[str] = set()
+        for r in avail:
+            if r.is_legacy:
+                if r.template_name not in seen_specs:
+                    self.seed_combo.addItem(f"[Legacy] {r.template_name}", r.template_name)
+                    seen_specs.add(r.template_name)
+            else:
+                spec = r.reference_spec()
+                if spec not in seen_specs:
+                    sc = scope_names.get(r.scope, r.scope.value)
+                    pin_tag = " ★default" if r.is_pinned_version else ""
+                    self.seed_combo.addItem(f"[{sc}] {r.template_name} v{r.version:03d}{pin_tag}", spec)
+                    seen_specs.add(spec)
+
+        if prev_data:
+            idx = self.seed_combo.findData(prev_data)
+            if idx >= 0:
+                self.seed_combo.setCurrentIndex(idx)
+        self.seed_combo.blockSignals(False)
 
     def _validate_and_accept(self) -> None:
         cleaned = self.path_edit.text().strip().strip("/")
@@ -710,11 +844,13 @@ class AddComponentDialog(QDialog):
         self.accept()
 
     def get_values(self) -> dict[str, object]:
+        seed_override = str(self.seed_combo.currentData() or "").strip() or None
         return {
             "component_path": self.path_edit.text().strip().strip("/"),
             "task_template": self.task_tpl_combo.currentText(),
             "software_override": str(self.software_combo.currentData() or "generic"),
             "seed_initial_working": self.seed_chk.isChecked(),
+            "seed_override": seed_override,
         }
 
 
@@ -829,7 +965,7 @@ class SoftwareSettingsDialog(QDialog):
         from obol.gui.integrations_dialog import IntegrationsManagerDialog
 
         key = self.key_edit.text().strip().lower()
-        initial = key if key in ("reaper", "resolve") else ""
+        initial = key if key in ("reaper", "resolve", "filmcraft") else ""
         dlg = IntegrationsManagerDialog(self, self.hub, initial_dcc=initial)
         dlg.exec()
         self._refresh_list(select_key=key)
@@ -938,10 +1074,14 @@ class ProjectAndVaultManagerDialog(QDialog):
         save_client_btn = QPushButton("Set Client Root")
         save_client_btn.setObjectName("PrimaryButton")
         save_client_btn.clicked.connect(self._save_client_root)
+        root_tpls_btn = QPushButton("Root Templates...")
+        root_tpls_btn.setToolTip("Manage versioned per-software seed templates for this Client Workspace Root")
+        root_tpls_btn.clicked.connect(self._open_root_templates)
         client_row.addWidget(QLabel("Client Root (Local):"))
         client_row.addWidget(self.client_root_edit, 1)
         client_row.addWidget(browse_client_btn)
         client_row.addWidget(save_client_btn)
+        client_row.addWidget(root_tpls_btn)
         layout.addLayout(client_row)
 
         # Optional Vault Header Box
@@ -1014,6 +1154,12 @@ class ProjectAndVaultManagerDialog(QDialog):
         new_root = self.hub.set_client_root(Path(p))
         self.client_root_edit.setText(str(new_root))
         self._refresh_view()
+
+    def _open_root_templates(self) -> None:
+        p = self.client_root_edit.text().strip()
+        root_dir = Path(p) if p else self.hub.get_client_root()
+        dlg = TemplateManagerDialog(self, self.hub, initial_tab=2, initial_root=root_dir)
+        dlg.exec()
 
     def _browse_vault(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Select Server Vault Folder")
@@ -1268,8 +1414,172 @@ class CreditsReportDialog(QDialog):
         self.copy_status_lbl.setText(f"✓ Exported {Path(dest_str).name}")
 
 
+class SaveSeedTemplateDialog(QDialog):
+    """Modal for saving a working file (or legacy seed) as a scoped, versioned software seed template."""
+
+    def __init__(
+        self,
+        parent: Optional[QWidget],
+        hub: ObolHub,
+        source_file: Path,
+        software_key: str = "reaper",
+        project_root: Optional[Path] = None,
+        client_root: Optional[Path] = None,
+        default_comment: str = "",
+        default_template_name: str = "default",
+    ) -> None:
+        super().__init__(parent)
+        self.hub = hub
+        self.source_file = source_file
+        self.project_root = project_root
+        self.client_root = client_root or hub.get_client_root()
+        self.saved_stream = None
+        self.saved_version = None
+        self.saved_scope = TemplateScope.CLIENT_ROOT
+
+        self.setWindowTitle("Save as Scoped Versioned Seed Template")
+        self.resize(520, 340)
+
+        layout = QVBoxLayout(self)
+        header = QLabel(f"Source File: <b>{source_file.name}</b>")
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        form = QFormLayout()
+
+        self.software_combo = QComboBox()
+        for sw_k in sorted(self.hub.config.software.keys()):
+            prof = self.hub.config.software[sw_k]
+            self.software_combo.addItem(f"{prof.display_name} ({prof.key})", prof.key)
+        sw_idx = self.software_combo.findData(normalize_software_key(software_key))
+        if sw_idx >= 0:
+            self.software_combo.setCurrentIndex(sw_idx)
+
+        self.scope_combo = QComboBox()
+        croot_lbl = self.client_root.name or str(self.client_root)
+        self.scope_combo.addItem(f"Client Workspace Root ({croot_lbl})", TemplateScope.CLIENT_ROOT.value)
+        if self.project_root is not None:
+            self.scope_combo.addItem(f"Project ({self.project_root.name})", TemplateScope.PROJECT.value)
+        self.scope_combo.addItem("Global (~/.obol)", TemplateScope.GLOBAL.value)
+
+        self.template_name_combo = QComboBox()
+        self.template_name_combo.setEditable(True)
+        self.template_name_combo.setEditText(default_template_name or "default")
+
+        self.next_version_label = QLabel("")
+        self.next_version_label.setObjectName("MutedText")
+
+        self.comment_edit = QLineEdit(default_comment)
+        self.comment_edit.setPlaceholderText("Optional version note (e.g. '48kHz show bus routing')")
+        self.tags_edit = QLineEdit()
+        self.tags_edit.setPlaceholderText("Optional comma-separated tags (e.g. stereo, podcast)")
+
+        self.set_default_tpl_chk = QCheckBox("Set as default template for this software in selected scope")
+        self.pin_version_chk = QCheckBox("Pin this version as default (unchecked = Always Latest)")
+        self.pin_version_chk.setChecked(False)
+
+        form.addRow("Software Profile:", self.software_combo)
+        form.addRow("Target Scope:", self.scope_combo)
+        form.addRow("Template Name:", self.template_name_combo)
+        form.addRow("Target Version:", self.next_version_label)
+        form.addRow("Version Note:", self.comment_edit)
+        form.addRow("Tags:", self.tags_edit)
+        form.addRow("", self.set_default_tpl_chk)
+        form.addRow("", self.pin_version_chk)
+        layout.addLayout(form)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        save_btn = QPushButton("Save Seed Template")
+        save_btn.setObjectName("PrimaryButton")
+        save_btn.setDefault(True)
+        save_btn.clicked.connect(self._save)
+        btns.addWidget(cancel_btn)
+        btns.addWidget(save_btn)
+        layout.addLayout(btns)
+
+        self.software_combo.currentIndexChanged.connect(self._refresh_streams)
+        self.scope_combo.currentIndexChanged.connect(self._refresh_streams)
+        self.template_name_combo.currentTextChanged.connect(self._refresh_version_preview)
+        self._refresh_streams()
+
+    def _current_scope(self) -> TemplateScope:
+        return TemplateScope(str(self.scope_combo.currentData() or TemplateScope.CLIENT_ROOT.value))
+
+    def _current_software(self) -> str:
+        return str(self.software_combo.currentData() or "generic")
+
+    def _refresh_streams(self) -> None:
+        sw = self._current_software()
+        scope = self._current_scope()
+        curr_txt = self.template_name_combo.currentText().strip() or "default"
+        manifest = self.hub.template_manager.seeds.load_manifest(
+            sw,
+            scope,
+            project_root=self.project_root,
+            client_root=self.client_root,
+        )
+        self.template_name_combo.blockSignals(True)
+        self.template_name_combo.clear()
+        names = sorted(manifest.templates.keys())
+        if "default" not in names:
+            names.insert(0, "default")
+        for n in names:
+            self.template_name_combo.addItem(n)
+        self.template_name_combo.setEditText(curr_txt)
+        self.template_name_combo.blockSignals(False)
+        self.set_default_tpl_chk.setChecked(not bool(manifest.default_template))
+        self._refresh_version_preview()
+
+    def _refresh_version_preview(self) -> None:
+        sw = self._current_software()
+        scope = self._current_scope()
+        tname = normalize_template_name(self.template_name_combo.currentText())
+        manifest = self.hub.template_manager.seeds.load_manifest(
+            sw,
+            scope,
+            project_root=self.project_root,
+            client_root=self.client_root,
+        )
+        stream = manifest.templates.get(tname)
+        if stream is None:
+            self.next_version_label.setText(f"Will create new template '{tname}' (v001)")
+        else:
+            next_v = stream.latest_version_number() + 1
+            self.next_version_label.setText(f"Will add v{next_v:03d} to existing template '{tname}'")
+
+    def _save(self) -> None:
+        sw = self._current_software()
+        scope = self._current_scope()
+        tname = normalize_template_name(self.template_name_combo.currentText())
+        prof = self.hub.get_software_profile(sw)
+        tags = [t.strip() for t in self.tags_edit.text().split(",") if t.strip()]
+        stream, ver = self.hub.template_manager.seeds.add_version(
+            software=sw,
+            template_name=tname,
+            source_path=self.source_file,
+            scope=scope,
+            comment=self.comment_edit.text().strip(),
+            author=self.hub.config.author_name,
+            tags=tags,
+            set_as_default_template=self.set_default_tpl_chk.isChecked(),
+            set_as_default_version=self.pin_version_chk.isChecked(),
+            project_root=self.project_root,
+            client_root=self.client_root,
+            ignore_patterns=prof.ignore_patterns,
+            lock_previous=prof.lock_previous_versions,
+            preferred_extensions=prof.extensions,
+        )
+        self.saved_stream = stream
+        self.saved_version = ver
+        self.saved_scope = scope
+        self.accept()
+
+
 class TemplateManagerDialog(QDialog):
-    """3-Tier Template Manager GUI for creating, editing, importing, and deleting Project, Component, and Seed File templates."""
+    """3-Tier Template Manager GUI for Project, Component, Scoped Versioned Software Seeds, and Legacy Seed Files."""
 
     def __init__(
         self,
@@ -1277,16 +1587,21 @@ class TemplateManagerDialog(QDialog):
         hub: ObolHub,
         active_project_root: Optional[Path] = None,
         active_component_path: str = "",
+        initial_tab: int = 0,
+        initial_root: Optional[Path] = None,
     ) -> None:
         super().__init__(parent)
         self.hub = hub
         self.tm = hub.template_manager
         self.active_project_root = active_project_root
         self.active_component_path = active_component_path
-        self.setWindowTitle("3-Tier Template Manager (Projects, Components & Working Seed Files)")
-        self.resize(820, 480)
+        self._seed_client_root = (initial_root or hub.get_client_root()).expanduser().resolve()
+        self.setWindowTitle("3-Tier Template Manager (Projects, Components & Scoped Software Seeds)")
+        self.resize(940, 560)
 
-        from PySide6.QtWidgets import QPlainTextEdit, QTabWidget
+        from PySide6.QtWidgets import QInputDialog, QPlainTextEdit, QTabWidget
+
+        self._QInputDialog = QInputDialog
 
         root_layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
@@ -1370,7 +1685,134 @@ class TemplateManagerDialog(QDialog):
         tt_layout.addWidget(tt_form_widget, 2)
         self.tabs.addTab(tab_task, "2. Component / Task Templates")
 
-        # ---------------- Tab 3: Tier-3 Working Seed Files ----------------
+        # ---------------- Tab 3: Scoped & Versioned Software Seed Templates ----------------
+        tab_seeds = QWidget()
+        seeds_layout = QVBoxLayout(tab_seeds)
+
+        scope_bar = QHBoxLayout()
+        scope_bar.addWidget(QLabel("Scope:"))
+        self.seed_scope_combo = QComboBox()
+        self.seed_scope_combo.addItem("Client Workspace Root", TemplateScope.CLIENT_ROOT.value)
+        if self.active_project_root is not None:
+            self.seed_scope_combo.addItem(f"Active Project ({self.active_project_root.name})", TemplateScope.PROJECT.value)
+        self.seed_scope_combo.addItem("Global (~/.obol)", TemplateScope.GLOBAL.value)
+        scope_bar.addWidget(self.seed_scope_combo)
+
+        self.seed_root_lbl = QLabel("Root:")
+        self.seed_root_edit = QLineEdit(str(self._seed_client_root))
+        self.seed_browse_root_btn = QPushButton("Browse Root...")
+        self.seed_browse_root_btn.clicked.connect(self._browse_seed_root)
+        scope_bar.addWidget(self.seed_root_lbl)
+        scope_bar.addWidget(self.seed_root_edit, 1)
+        scope_bar.addWidget(self.seed_browse_root_btn)
+        seeds_layout.addLayout(scope_bar)
+
+        self.seed_effective_banner = QLabel("")
+        self.seed_effective_banner.setObjectName("MutedText")
+        self.seed_effective_banner.setWordWrap(True)
+        seeds_layout.addWidget(self.seed_effective_banner)
+
+        seed_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # Left pane: Software list
+        sw_pane = QWidget()
+        sw_layout = QVBoxLayout(sw_pane)
+        sw_layout.setContentsMargins(0, 0, 0, 0)
+        sw_hdr = QLabel("Software")
+        sw_hdr.setObjectName("SectionHeader")
+        sw_layout.addWidget(sw_hdr)
+        self.seed_software_list = QListWidget()
+        sw_layout.addWidget(self.seed_software_list, 1)
+        seed_splitter.addWidget(sw_pane)
+
+        # Middle pane: Named templates for (scope, software)
+        stream_pane = QWidget()
+        stream_layout = QVBoxLayout(stream_pane)
+        stream_layout.setContentsMargins(0, 0, 0, 0)
+        stream_hdr = QLabel("Named Templates")
+        stream_hdr.setObjectName("SectionHeader")
+        stream_layout.addWidget(stream_hdr)
+        self.seed_stream_list = QListWidget()
+        stream_layout.addWidget(self.seed_stream_list, 1)
+
+        stream_btns_top = QHBoxLayout()
+        self.seed_import_btn = QPushButton("+ Import / New...")
+        self.seed_import_btn.setObjectName("PrimaryButton")
+        self.seed_import_btn.clicked.connect(self._seed_import_new)
+        self.seed_set_default_btn = QPushButton("Set Default")
+        self.seed_set_default_btn.clicked.connect(self._seed_set_default_stream)
+        stream_btns_top.addWidget(self.seed_import_btn)
+        stream_btns_top.addWidget(self.seed_set_default_btn)
+        stream_layout.addLayout(stream_btns_top)
+
+        stream_btns_bot = QHBoxLayout()
+        self.seed_inherit_btn = QPushButton("Inherit (Clear)")
+        self.seed_inherit_btn.setToolTip("Clear this scope's default override so it inherits from parent scope")
+        self.seed_inherit_btn.clicked.connect(self._seed_clear_default_stream)
+        self.seed_del_stream_btn = QPushButton("Delete")
+        self.seed_del_stream_btn.setObjectName("DangerButton")
+        self.seed_del_stream_btn.clicked.connect(self._seed_delete_stream)
+        stream_btns_bot.addWidget(self.seed_inherit_btn)
+        stream_btns_bot.addWidget(self.seed_del_stream_btn)
+        stream_layout.addLayout(stream_btns_bot)
+        seed_splitter.addWidget(stream_pane)
+
+        # Right pane: Versions + default version policy
+        ver_pane = QWidget()
+        ver_layout = QVBoxLayout(ver_pane)
+        ver_layout.setContentsMargins(0, 0, 0, 0)
+
+        ver_top_row = QHBoxLayout()
+        ver_hdr = QLabel("Template Versions")
+        ver_hdr.setObjectName("SectionHeader")
+        ver_top_row.addWidget(ver_hdr)
+        ver_top_row.addStretch()
+        ver_top_row.addWidget(QLabel("Default Version:"))
+        self.seed_default_ver_combo = QComboBox()
+        self.seed_default_ver_combo.activated.connect(self._seed_apply_default_version)
+        ver_top_row.addWidget(self.seed_default_ver_combo)
+        ver_layout.addLayout(ver_top_row)
+
+        self.seed_versions_table = QTableWidget(0, 5)
+        self.seed_versions_table.setHorizontalHeaderLabels(["Version", "Primary File", "Default", "Created", "Note"])
+        self.seed_versions_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.seed_versions_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.seed_versions_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.seed_versions_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        ver_layout.addWidget(self.seed_versions_table, 1)
+
+        ver_btns = QHBoxLayout()
+        self.seed_add_ver_btn = QPushButton("+ Add Version...")
+        self.seed_add_ver_btn.clicked.connect(self._seed_add_version_to_stream)
+        self.seed_vup_open_btn = QPushButton("Version Up & Open")
+        self.seed_vup_open_btn.setObjectName("PrimaryButton")
+        self.seed_vup_open_btn.clicked.connect(lambda: self._seed_version_up(open_in_app=True))
+        self.seed_open_btn = QPushButton("Open in App")
+        self.seed_open_btn.clicked.connect(self._seed_open_selected_version)
+        self.seed_note_btn = QPushButton("Edit Note")
+        self.seed_note_btn.clicked.connect(self._seed_edit_version_note)
+        self.seed_del_ver_btn = QPushButton("Delete Ver")
+        self.seed_del_ver_btn.setObjectName("DangerButton")
+        self.seed_del_ver_btn.clicked.connect(self._seed_delete_version)
+        self.seed_open_dir_btn = QPushButton("Open Folder")
+        self.seed_open_dir_btn.clicked.connect(self._seed_open_scope_folder)
+        for b in (
+            self.seed_add_ver_btn,
+            self.seed_vup_open_btn,
+            self.seed_open_btn,
+            self.seed_note_btn,
+            self.seed_del_ver_btn,
+            self.seed_open_dir_btn,
+        ):
+            ver_btns.addWidget(b)
+        ver_layout.addLayout(ver_btns)
+        seed_splitter.addWidget(ver_pane)
+
+        seed_splitter.setSizes([190, 230, 480])
+        seeds_layout.addWidget(seed_splitter, 1)
+        self.tabs.addTab(tab_seeds, "3. Software Seed Templates")
+
+        # ---------------- Tab 4: Legacy Working Seed Files ----------------
         tab_files = QWidget()
         tf_layout = QVBoxLayout(tab_files)
         self.seed_files_table = QTableWidget(0, 3)
@@ -1384,19 +1826,22 @@ class TemplateManagerDialog(QDialog):
         imp_seed_btn.clicked.connect(self._import_seed_file)
         edit_seed_btn = QPushButton("Open Selected Seed File in App")
         edit_seed_btn.clicked.connect(self._open_selected_seed_file)
+        mig_seed_btn = QPushButton("Migrate to Versioned Seed...")
+        mig_seed_btn.clicked.connect(self._migrate_selected_legacy_seed)
         del_seed_btn = QPushButton("Delete Selected Seed File")
         del_seed_btn.clicked.connect(self._delete_selected_seed_file)
         tf_btns.addWidget(imp_seed_btn)
         tf_btns.addWidget(edit_seed_btn)
+        tf_btns.addWidget(mig_seed_btn)
         tf_btns.addWidget(del_seed_btn)
         tf_btns.addStretch()
         tf_layout.addLayout(tf_btns)
-        self.tabs.addTab(tab_files, "3. Working Seed Files")
+        self.tabs.addTab(tab_files, "4. Legacy Seed Files")
 
         root_layout.addWidget(self.tabs)
 
         footer = QHBoxLayout()
-        path_lbl = QLabel(f"Templates Directory: {self.tm.templates_root}")
+        path_lbl = QLabel(f"Global Templates: {self.tm.templates_root}")
         path_lbl.setObjectName("MutedText")
         open_dir_btn = QPushButton("Open Templates Folder in Explorer")
         open_dir_btn.clicked.connect(self._open_templates_folder)
@@ -1408,7 +1853,465 @@ class TemplateManagerDialog(QDialog):
         footer.addWidget(close_dlg_btn)
         root_layout.addLayout(footer)
 
+        self.seed_scope_combo.currentIndexChanged.connect(self._on_seed_scope_changed)
+        self.seed_root_edit.editingFinished.connect(self._on_seed_root_edited)
+        self.seed_software_list.currentItemChanged.connect(self._on_seed_software_changed)
+        self.seed_stream_list.currentItemChanged.connect(self._on_seed_stream_changed)
+
         self._refresh_all_lists()
+        if 0 <= initial_tab < self.tabs.count():
+            self.tabs.setCurrentIndex(initial_tab)
+
+    def _seed_scope(self) -> TemplateScope:
+        return TemplateScope(str(self.seed_scope_combo.currentData() or TemplateScope.CLIENT_ROOT.value))
+
+    def _seed_root_path(self) -> Path:
+        txt = self.seed_root_edit.text().strip()
+        if txt:
+            return Path(txt).expanduser().resolve()
+        return self._seed_client_root
+
+    def _selected_seed_software(self) -> str:
+        item = self.seed_software_list.currentItem()
+        if item is not None:
+            return str(item.data(Qt.ItemDataRole.UserRole) or "reaper")
+        return "reaper"
+
+    def _selected_seed_stream_name(self) -> str:
+        item = self.seed_stream_list.currentItem()
+        if item is not None:
+            return str(item.data(Qt.ItemDataRole.UserRole) or "")
+        return ""
+
+    def _browse_seed_root(self) -> None:
+        folder = QFileDialog.getExistingDirectory(self, "Select Client Workspace Root", str(self._seed_root_path()))
+        if folder:
+            self._seed_client_root = Path(folder).resolve()
+            self.seed_root_edit.setText(str(self._seed_client_root))
+            self._refresh_seed_tab()
+
+    def _on_seed_root_edited(self) -> None:
+        self._seed_client_root = self._seed_root_path()
+        self._refresh_seed_tab()
+
+    def _on_seed_scope_changed(self) -> None:
+        is_root = self._seed_scope() == TemplateScope.CLIENT_ROOT
+        self.seed_root_lbl.setVisible(is_root)
+        self.seed_root_edit.setVisible(is_root)
+        self.seed_browse_root_btn.setVisible(is_root)
+        self._refresh_seed_tab()
+
+    def _refresh_seed_tab(self) -> None:
+        scope = self._seed_scope()
+        croot = self._seed_root_path()
+        prev_sw = self._selected_seed_software()
+
+        sw_keys = sorted(
+            set(self.hub.config.software.keys())
+            | set(self.tm.seeds.list_scope_software(scope, project_root=self.active_project_root, client_root=croot))
+        )
+        self.seed_software_list.blockSignals(True)
+        self.seed_software_list.clear()
+        target_row = 0
+        for idx, sw_k in enumerate(sw_keys):
+            prof = self.hub.get_software_profile(sw_k)
+            man = self.tm.seeds.load_manifest(
+                sw_k,
+                scope,
+                project_root=self.active_project_root,
+                client_root=croot,
+                preferred_extensions=prof.extensions,
+            )
+            if man.default_template and man.default_template in man.templates:
+                stream = man.templates[man.default_template]
+                vobj = stream.resolve_version()
+                v_str = vobj.version_label if vobj else "—"
+                badge = f"★ {man.default_template} {v_str}"
+            elif man.templates:
+                badge = f"{len(man.templates)} tpl (inherited)"
+            else:
+                badge = "↳ inherited"
+            item = QListWidgetItem(f"{prof.display_name} [{sw_k}]\n  {badge}")
+            item.setData(Qt.ItemDataRole.UserRole, sw_k)
+            self.seed_software_list.addItem(item)
+            if sw_k == prev_sw:
+                target_row = idx
+        self.seed_software_list.blockSignals(False)
+
+        if self.seed_software_list.count() > 0:
+            self.seed_software_list.setCurrentRow(target_row)
+        self._refresh_seed_streams()
+
+    def _on_seed_software_changed(self, _curr: Optional[QListWidgetItem], _prev: Optional[QListWidgetItem]) -> None:
+        self._refresh_seed_streams()
+
+    def _refresh_seed_streams(self) -> None:
+        scope = self._seed_scope()
+        croot = self._seed_root_path()
+        sw = self._selected_seed_software()
+        prof = self.hub.get_software_profile(sw)
+
+        # Effective cascade banner
+        proj_arg = self.active_project_root if scope == TemplateScope.PROJECT else None
+        resolved_eff = self.tm.resolve_seed_template(
+            software=sw,
+            project_root=proj_arg,
+            client_root=croot,
+        )
+        if resolved_eff is not None:
+            self.seed_effective_banner.setText(
+                f"Effective Default for {prof.display_name}:  {resolved_eff.display_label()}  →  {resolved_eff.primary_file}"
+            )
+        else:
+            self.seed_effective_banner.setText(
+                f"Effective Default for {prof.display_name}:  (None configured — falls back to TaskTemplate or blank file)"
+            )
+
+        prev_stream = self._selected_seed_stream_name()
+        man = self.tm.seeds.load_manifest(
+            sw,
+            scope,
+            project_root=self.active_project_root,
+            client_root=croot,
+            preferred_extensions=prof.extensions,
+        )
+        self.seed_stream_list.blockSignals(True)
+        self.seed_stream_list.clear()
+        target_row = 0
+        for idx, tname in enumerate(sorted(man.templates.keys())):
+            st = man.templates[tname]
+            is_def = tname == man.default_template
+            prefix = "★ " if is_def else "  "
+            pin_info = f"pinned v{st.default_version:03d}" if st.default_version > 0 else "latest"
+            item = QListWidgetItem(f"{prefix}{tname}  ({len(st.versions)}v, {pin_info})")
+            item.setData(Qt.ItemDataRole.UserRole, tname)
+            self.seed_stream_list.addItem(item)
+            if tname == prev_stream:
+                target_row = idx
+        self.seed_stream_list.blockSignals(False)
+
+        if self.seed_stream_list.count() > 0:
+            self.seed_stream_list.setCurrentRow(target_row)
+        self._refresh_seed_versions()
+
+    def _on_seed_stream_changed(self, _curr: Optional[QListWidgetItem], _prev: Optional[QListWidgetItem]) -> None:
+        self._refresh_seed_versions()
+
+    def _refresh_seed_versions(self) -> None:
+        scope = self._seed_scope()
+        croot = self._seed_root_path()
+        sw = self._selected_seed_software()
+        tname = self._selected_seed_stream_name()
+        prof = self.hub.get_software_profile(sw)
+
+        self.seed_default_ver_combo.blockSignals(True)
+        self.seed_default_ver_combo.clear()
+        self.seed_versions_table.setRowCount(0)
+
+        if not tname:
+            self.seed_default_ver_combo.addItem("Always Latest (Auto)", 0)
+            self.seed_default_ver_combo.blockSignals(False)
+            return
+
+        man = self.tm.seeds.load_manifest(
+            sw,
+            scope,
+            project_root=self.active_project_root,
+            client_root=croot,
+            preferred_extensions=prof.extensions,
+        )
+        stream = man.templates.get(tname)
+        if stream is None:
+            self.seed_default_ver_combo.addItem("Always Latest (Auto)", 0)
+            self.seed_default_ver_combo.blockSignals(False)
+            return
+
+        sw_dir = self.tm.seeds.get_seeds_dir(scope, project_root=self.active_project_root, client_root=croot) / sw
+        self.seed_default_ver_combo.addItem("Always Latest (Auto)", 0)
+        vers_desc = sorted(stream.versions, key=lambda v: v.version, reverse=True)
+        for v in vers_desc:
+            self.seed_default_ver_combo.addItem(f"Pin {v.version_label}", v.version)
+        def_idx = self.seed_default_ver_combo.findData(stream.default_version)
+        self.seed_default_ver_combo.setCurrentIndex(def_idx if def_idx >= 0 else 0)
+        self.seed_default_ver_combo.blockSignals(False)
+
+        resolved_ver = stream.resolve_version()
+        self.seed_versions_table.setRowCount(len(vers_desc))
+        for row_idx, v in enumerate(vers_desc):
+            p_abs = sw_dir / v.primary_file
+            is_ro = p_abs.is_file() and not (p_abs.stat().st_mode & 0o200)
+            lock_icon = " 🔒" if is_ro else ""
+            ver_item = QTableWidgetItem(f"{v.version_label}{lock_icon}")
+            ver_item.setData(Qt.ItemDataRole.UserRole, v.version)
+
+            file_item = QTableWidgetItem(Path(v.primary_file).name)
+            file_item.setData(Qt.ItemDataRole.UserRole, str(p_abs))
+
+            if resolved_ver and v.version == resolved_ver.version:
+                def_txt = "★ Pinned" if stream.default_version > 0 else "★ Latest"
+            else:
+                def_txt = ""
+            def_item = QTableWidgetItem(def_txt)
+            created_item = QTableWidgetItem(v.created_at[:19].replace("T", " "))
+            note_item = QTableWidgetItem(v.comment)
+
+            self.seed_versions_table.setItem(row_idx, 0, ver_item)
+            self.seed_versions_table.setItem(row_idx, 1, file_item)
+            self.seed_versions_table.setItem(row_idx, 2, def_item)
+            self.seed_versions_table.setItem(row_idx, 3, created_item)
+            self.seed_versions_table.setItem(row_idx, 4, note_item)
+
+    def _selected_seed_version_num(self) -> Optional[int]:
+        row = self.seed_versions_table.currentRow()
+        if row < 0 and self.seed_versions_table.rowCount() > 0:
+            row = 0
+        if row < 0:
+            return None
+        item = self.seed_versions_table.item(row, 0)
+        if item is None:
+            return None
+        val = item.data(Qt.ItemDataRole.UserRole)
+        return int(val) if val is not None else None
+
+    def _seed_import_new(self) -> None:
+        sw = self._selected_seed_software()
+        scope = self._seed_scope()
+        croot = self._seed_root_path()
+        prof = self.hub.get_software_profile(sw)
+        file_str, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Select Starter Template File for {prof.display_name}",
+        )
+        if not file_str:
+            return
+        dlg = SaveSeedTemplateDialog(
+            self,
+            self.hub,
+            source_file=Path(file_str),
+            software_key=sw,
+            project_root=self.active_project_root,
+            client_root=croot,
+        )
+        scope_idx = dlg.scope_combo.findData(scope.value)
+        if scope_idx >= 0:
+            dlg.scope_combo.setCurrentIndex(scope_idx)
+        if dlg.exec() == SaveSeedTemplateDialog.DialogCode.Accepted:
+            self._refresh_seed_tab()
+
+    def _seed_add_version_to_stream(self) -> None:
+        sw = self._selected_seed_software()
+        tname = self._selected_seed_stream_name()
+        if not tname:
+            self._seed_import_new()
+            return
+        scope = self._seed_scope()
+        croot = self._seed_root_path()
+        prof = self.hub.get_software_profile(sw)
+        file_str, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Select File for New Version of '{tname}' ({prof.display_name})",
+        )
+        if not file_str:
+            return
+        note, ok = self._QInputDialog.getText(self, "Add Template Version", "Version note (optional):")
+        if not ok:
+            return
+        self.tm.seeds.add_version(
+            software=sw,
+            template_name=tname,
+            source_path=Path(file_str),
+            scope=scope,
+            comment=note.strip(),
+            author=self.hub.config.author_name,
+            project_root=self.active_project_root,
+            client_root=croot,
+            ignore_patterns=prof.ignore_patterns,
+            lock_previous=prof.lock_previous_versions,
+            preferred_extensions=prof.extensions,
+        )
+        self._refresh_seed_tab()
+
+    def _seed_version_up(self, open_in_app: bool = True) -> None:
+        sw = self._selected_seed_software()
+        tname = self._selected_seed_stream_name()
+        if not tname:
+            return
+        scope = self._seed_scope()
+        croot = self._seed_root_path()
+        prof = self.hub.get_software_profile(sw)
+        src_ver = self._selected_seed_version_num()
+        note, ok = self._QInputDialog.getText(self, "Version Up Template", "New version note (optional):")
+        if not ok:
+            return
+        _, new_ver = self.tm.seeds.version_up_template(
+            software=sw,
+            template_name=tname,
+            scope=scope,
+            source_version=src_ver,
+            comment=note.strip(),
+            author=self.hub.config.author_name,
+            project_root=self.active_project_root,
+            client_root=croot,
+            ignore_patterns=prof.ignore_patterns,
+            lock_previous=prof.lock_previous_versions,
+            preferred_extensions=prof.extensions,
+        )
+        self._refresh_seed_tab()
+        if open_in_app:
+            sw_dir = self.tm.seeds.get_seeds_dir(scope, project_root=self.active_project_root, client_root=croot) / sw
+            p_abs = sw_dir / new_ver.primary_file
+            if p_abs.is_file():
+                from obol.plugins.base import launch_file_with_profile
+
+                launch_file_with_profile(p_abs, prof)
+
+    def _seed_open_selected_version(self) -> None:
+        row = self.seed_versions_table.currentRow()
+        if row < 0 and self.seed_versions_table.rowCount() > 0:
+            row = 0
+        if row < 0:
+            return
+        file_item = self.seed_versions_table.item(row, 1)
+        if file_item is None:
+            return
+        p_abs = Path(str(file_item.data(Qt.ItemDataRole.UserRole) or ""))
+        if p_abs.is_file():
+            from obol.plugins.base import launch_file_with_profile
+
+            prof = self.hub.get_software_profile(self._selected_seed_software())
+            launch_file_with_profile(p_abs, prof)
+
+    def _seed_edit_version_note(self) -> None:
+        sw = self._selected_seed_software()
+        tname = self._selected_seed_stream_name()
+        ver = self._selected_seed_version_num()
+        if not tname or ver is None:
+            return
+        scope = self._seed_scope()
+        croot = self._seed_root_path()
+        row = self.seed_versions_table.currentRow()
+        curr_note = self.seed_versions_table.item(row, 4).text() if row >= 0 and self.seed_versions_table.item(row, 4) else ""
+        new_note, ok = self._QInputDialog.getText(self, f"Edit Note for v{ver:03d}", "Version note:", text=curr_note)
+        if ok:
+            self.tm.seeds.update_metadata(
+                sw,
+                tname,
+                scope,
+                version=ver,
+                comment=new_note.strip(),
+                project_root=self.active_project_root,
+                client_root=croot,
+            )
+            self._refresh_seed_versions()
+
+    def _seed_set_default_stream(self) -> None:
+        sw = self._selected_seed_software()
+        tname = self._selected_seed_stream_name()
+        if not tname:
+            return
+        self.tm.seeds.set_default_template(
+            sw,
+            tname,
+            self._seed_scope(),
+            project_root=self.active_project_root,
+            client_root=self._seed_root_path(),
+        )
+        self._refresh_seed_tab()
+
+    def _seed_clear_default_stream(self) -> None:
+        sw = self._selected_seed_software()
+        self.tm.seeds.set_default_template(
+            sw,
+            "",
+            self._seed_scope(),
+            project_root=self.active_project_root,
+            client_root=self._seed_root_path(),
+        )
+        self._refresh_seed_tab()
+
+    def _seed_apply_default_version(self, _idx: int = 0) -> None:
+        sw = self._selected_seed_software()
+        tname = self._selected_seed_stream_name()
+        if not tname:
+            return
+        ver_val = int(self.seed_default_ver_combo.currentData() or 0)
+        self.tm.seeds.set_default_version(
+            sw,
+            tname,
+            ver_val,
+            self._seed_scope(),
+            project_root=self.active_project_root,
+            client_root=self._seed_root_path(),
+        )
+        self._refresh_seed_tab()
+
+    def _seed_delete_version(self) -> None:
+        sw = self._selected_seed_software()
+        tname = self._selected_seed_stream_name()
+        ver = self._selected_seed_version_num()
+        if not tname or ver is None:
+            return
+        self.tm.seeds.delete_version(
+            sw,
+            tname,
+            ver,
+            self._seed_scope(),
+            project_root=self.active_project_root,
+            client_root=self._seed_root_path(),
+        )
+        self._refresh_seed_tab()
+
+    def _seed_delete_stream(self) -> None:
+        sw = self._selected_seed_software()
+        tname = self._selected_seed_stream_name()
+        if not tname:
+            return
+        self.tm.seeds.delete_template(
+            sw,
+            tname,
+            self._seed_scope(),
+            project_root=self.active_project_root,
+            client_root=self._seed_root_path(),
+        )
+        self._refresh_seed_tab()
+
+    def _seed_open_scope_folder(self) -> None:
+        import os
+        import sys
+
+        seeds_dir = self.tm.seeds.get_seeds_dir(
+            self._seed_scope(),
+            project_root=self.active_project_root,
+            client_root=self._seed_root_path(),
+        )
+        seeds_dir.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32" and hasattr(os, "startfile"):
+            os.startfile(str(seeds_dir))
+
+    def _migrate_selected_legacy_seed(self) -> None:
+        row = self.seed_files_table.currentRow()
+        if row < 0:
+            return
+        path_item = self.seed_files_table.item(row, 2)
+        if not path_item:
+            return
+        fpath = Path(path_item.text())
+        if not fpath.is_file():
+            return
+        prof = self.hub.detect_software_for_extension(fpath.suffix)
+        dlg = SaveSeedTemplateDialog(
+            self,
+            self.hub,
+            source_file=fpath,
+            software_key=prof.key,
+            project_root=self.active_project_root,
+            client_root=self._seed_root_path(),
+            default_comment=f"Migrated from legacy {fpath.name}",
+            default_template_name="default",
+        )
+        if dlg.exec() == SaveSeedTemplateDialog.DialogCode.Accepted:
+            self._refresh_seed_tab()
+            self.tabs.setCurrentIndex(2)
 
     def _refresh_all_lists(self) -> None:
         # Seed files first so combo in tab 2 is populated
@@ -1438,6 +2341,8 @@ class TemplateManagerDialog(QDialog):
         if self.task_tpl_list.count() > 0:
             items = self.task_tpl_list.findItems(curr_t, Qt.MatchFlag.MatchExactly)
             self.task_tpl_list.setCurrentItem(items[0] if items else self.task_tpl_list.item(0))
+
+        self._on_seed_scope_changed()
 
     def _load_project_template(self, name: str) -> None:
         if not name:

@@ -43,6 +43,7 @@ class ObolHub:
         self.template_manager = TemplateManager(
             hub_dir=self.hub_dir,
             vault_dir=self.get_vault_path() if self.get_vault_status() == VaultStatus.ONLINE else None,
+            client_root=self.get_client_root(),
         )
 
     def _load_config(self) -> GlobalConfig:
@@ -96,6 +97,7 @@ class ObolHub:
             self.save_projects()
 
         self.discover_client_root_projects()
+        self.template_manager.client_root = resolved
         return resolved
 
     def set_last_active_project(self, project_name: str) -> None:

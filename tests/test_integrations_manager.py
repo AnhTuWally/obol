@@ -20,7 +20,7 @@ from obol.core.workspace import ObolWorkspace
 from obol.gui.app import ObolMainWindow
 from obol.gui.dialogs import SoftwareSettingsDialog
 from obol.gui.integrations_dialog import IntegrationsManagerDialog
-from obol.plugins.integrations import DCCIntegrationManager
+from obol.plugins.integrations import DCCIntegrationManager, REAPER_INTEGRATION_VERSION
 from obol.plugins.reaper_bridge import ReaperBridgeClient
 from obol.plugins.resolve_bridge import ResolveBridgeClient
 
@@ -43,21 +43,28 @@ class TestIntegrationsManager(unittest.TestCase):
     def test_manager_reports_drift_detection_and_install_all(self) -> None:
         reaper_res = self.root / "REAPER_RES"
         resolve_scripts = self.root / "ResolveScripts"
+        filmcraft_dir = self.root / "FilmCraftDir"
         reaper_res.mkdir(parents=True, exist_ok=True)
         resolve_scripts.mkdir(parents=True, exist_ok=True)
-        overrides = {"reaper": reaper_res, "resolve": resolve_scripts}
+        filmcraft_dir.mkdir(parents=True, exist_ok=True)
+        (filmcraft_dir / "filmcraft.exe").write_bytes(b"MZ")
+        (filmcraft_dir / "filmcraft-cli.exe").write_bytes(b"MZ")
+        overrides = {"reaper": reaper_res, "resolve": resolve_scripts, "filmcraft": filmcraft_dir}
 
         rep_r0 = self.mgr.get_report("reaper", target_dir=reaper_res)
         rep_d0 = self.mgr.get_report("resolve", target_dir=resolve_scripts)
+        rep_f0 = self.mgr.get_report("filmcraft", target_dir=filmcraft_dir)
         self.assertTrue(rep_r0.detected)
         self.assertFalse(rep_r0.installed)
         self.assertEqual(rep_r0.overall_state, "not_installed")
         self.assertTrue(rep_d0.detected)
         self.assertFalse(rep_d0.installed)
+        self.assertTrue(rep_f0.detected)
+        self.assertFalse(rep_f0.installed)
 
         # Batch install all detected
         reports = self.mgr.install_all_detected(target_dir_overrides=overrides)
-        self.assertEqual(len(reports), 2)
+        self.assertEqual(len(reports), 3)
         for rep in reports:
             self.assertTrue(rep.installed)
             self.assertFalse(rep.needs_update)
@@ -66,9 +73,12 @@ class TestIntegrationsManager(unittest.TestCase):
 
         # Simulate config drift in REAPER obol_config.lua
         cfg_lua = reaper_res / "Scripts" / "Obol" / "obol_config.lua"
-        txt = cfg_lua.read_text(encoding="utf-8").replace('INTEGRATION_VERSION = [=[1.1]=]', 'INTEGRATION_VERSION = [=[0.9]=]')
-        if 'INTEGRATION_VERSION = [=[0.9]=]' not in txt:
-            txt = cfg_lua.read_text(encoding="utf-8").replace('1.1', '0.9', 1)
+        txt = cfg_lua.read_text(encoding="utf-8").replace(
+            f"INTEGRATION_VERSION = [=[{REAPER_INTEGRATION_VERSION}]=]",
+            "INTEGRATION_VERSION = [=[0.9]=]",
+        )
+        if "INTEGRATION_VERSION = [=[0.9]=]" not in txt:
+            txt = cfg_lua.read_text(encoding="utf-8").replace(REAPER_INTEGRATION_VERSION, "0.9", 1)
         cfg_lua.write_text(txt, encoding="utf-8")
 
         drifted = self.mgr.get_report("reaper", target_dir=reaper_res)
@@ -81,11 +91,13 @@ class TestIntegrationsManager(unittest.TestCase):
         self.assertFalse(repaired.needs_update)
         self.assertEqual(repaired.overall_state, "installed")
 
-        # Uninstall both
+        # Uninstall all
         un_r = self.mgr.uninstall("reaper", target_dir=reaper_res)
         un_d = self.mgr.uninstall("resolve", target_dir=resolve_scripts)
+        un_f = self.mgr.uninstall("filmcraft", target_dir=filmcraft_dir)
         self.assertFalse(un_r.installed)
         self.assertFalse(un_d.installed)
+        self.assertFalse(un_f.installed)
 
     def test_manager_test_connection_and_resolve_bindings(self) -> None:
         # Resolve bindings management
@@ -174,8 +186,12 @@ class TestIntegrationsManager(unittest.TestCase):
     def test_integrations_manager_dialog_and_main_window_smoke(self) -> None:
         r_dir = self.root / "UI_REAPER"
         d_dir = self.root / "UI_RESOLVE"
+        f_dir = self.root / "UI_FILMCRAFT"
         r_dir.mkdir(parents=True, exist_ok=True)
         d_dir.mkdir(parents=True, exist_ok=True)
+        f_dir.mkdir(parents=True, exist_ok=True)
+        (f_dir / "filmcraft.exe").write_bytes(b"MZ")
+        (f_dir / "filmcraft-cli.exe").write_bytes(b"MZ")
 
         ResolveBridgeClient(self.hub, allow_studio_api=False).set_project_binding("DVR_Test", "p1", "edit")
 
@@ -184,9 +200,9 @@ class TestIntegrationsManager(unittest.TestCase):
             self.hub,
             initial_dcc="reaper",
             allow_resolve_studio_api=False,
-            target_dir_overrides={"reaper": r_dir, "resolve": d_dir},
+            target_dir_overrides={"reaper": r_dir, "resolve": d_dir, "filmcraft": f_dir},
         )
-        self.assertEqual(dlg.dcc_list.topLevelItemCount(), 2)
+        self.assertEqual(dlg.dcc_list.topLevelItemCount(), 3)
         self.assertGreaterEqual(dlg.health_table.rowCount(), 6)
 
         # Install REAPER directly from UI

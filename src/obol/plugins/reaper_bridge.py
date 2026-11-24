@@ -230,6 +230,21 @@ class ReaperBridgeClient:
     def save_project(self, timeout_s: float = 15.0) -> dict[str, Any]:
         return self.send_command("save_project", {}, timeout_s=timeout_s)
 
+    def save_project_as(
+        self,
+        rpp_path: Path,
+        ensure_open: bool = True,
+        timeout_s: float = 20.0,
+    ) -> dict[str, Any]:
+        return self.send_command(
+            "save_project_as",
+            {
+                "path": str(Path(rpp_path).resolve()),
+                "ensure_open": bool(ensure_open),
+            },
+            timeout_s=timeout_s,
+        )
+
     def reload_project(self, rpp_path: Path, timeout_s: float = 15.0) -> dict[str, Any]:
         return self.open_project(rpp_path, new_tab=False, noprompt=True, timeout_s=timeout_s)
 
@@ -238,16 +253,20 @@ class ReaperBridgeClient:
         file_paths: list[Path],
         mode: str = "new_track",
         asset_meta: Optional[dict[str, Any]] = None,
+        asset_metas: Optional[list[dict[str, Any]]] = None,
         timeout_s: float = 20.0,
     ) -> dict[str, Any]:
         paths = [str(Path(p).resolve()) for p in file_paths]
+        params: dict[str, Any] = {
+            "file_paths": paths,
+            "mode": mode,
+            "asset_meta": asset_meta or {},
+        }
+        if asset_metas is not None:
+            params["asset_metas"] = [dict(m) for m in asset_metas]
         return self.send_command(
             "insert_media",
-            {
-                "file_paths": paths,
-                "mode": mode,
-                "asset_meta": asset_meta or {},
-            },
+            params,
             timeout_s=timeout_s,
         )
 
@@ -256,11 +275,35 @@ class ReaperBridgeClient:
         items = res.get("items", [])
         return [dict(it) for it in items if isinstance(it, dict)]
 
-    def update_media_sources(self, replacements: dict[str, str], timeout_s: float = 20.0) -> dict[str, Any]:
-        norm_map = {str(Path(k).resolve()): str(Path(v).resolve()) for k, v in replacements.items()}
+    def update_media_sources(
+        self,
+        replacements: Optional[dict[str, str]] = None,
+        take_updates: Optional[list[dict[str, Any]]] = None,
+        update_mode: str = "replace_source",
+        midi_mode: str = "preserve",
+        match_length: str = "auto",
+        timeout_s: float = 20.0,
+    ) -> dict[str, Any]:
+        norm_map = {str(Path(k).resolve()): str(Path(v).resolve()) for k, v in (replacements or {}).items()}
+        norm_updates: list[dict[str, Any]] = []
+        for upd in (take_updates or []):
+            entry = dict(upd)
+            if entry.get("target_path"):
+                entry["target_path"] = str(Path(str(entry["target_path"])).resolve())
+            if entry.get("old_path"):
+                entry["old_path"] = str(Path(str(entry["old_path"])).resolve())
+            norm_updates.append(entry)
+        payload: dict[str, Any] = {
+            "replacements": norm_map,
+            "update_mode": update_mode,
+            "midi_mode": midi_mode,
+            "match_length": match_length,
+        }
+        if norm_updates:
+            payload["take_updates"] = norm_updates
         return self.send_command(
             "update_media_sources",
-            {"replacements": norm_map},
+            payload,
             timeout_s=timeout_s,
         )
 

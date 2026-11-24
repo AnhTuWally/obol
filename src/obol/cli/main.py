@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from obol.core.hub import ObolHub
-from obol.core.models import SoftwareProfile, VersionUpStrategy
+from obol.core.models import SoftwareProfile, TemplateScope, VersionUpStrategy
 from obol.core.storage import discover_project_components, load_component_snapshot
 from obol.core.sync import SyncEngine
 from obol.core.workspace import ObolWorkspace
@@ -79,6 +79,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_tc.add_argument("component_path", help="Relative component path (e.g. 'audio' or 'song_1/mixing')")
     p_tc.add_argument("-p", "--project", help="Project name or code")
     p_tc.add_argument("--template", default="reaper_daw", help="Tier-2 Task template (reaper_daw, blender_3d, krita_art, generic_media)")
+    p_tc.add_argument("--software", help="Override bound software profile key")
+    p_tc.add_argument("--seed", help="Override initial working seed template (seed:... spec, name, or filename)")
     p_tl = task_sub.add_parser("list", help="List all components in a project")
     p_tl.add_argument("-p", "--project", help="Project name or code")
 
@@ -144,6 +146,70 @@ def build_parser() -> argparse.ArgumentParser:
     p_cap.add_argument("source", help="Path to source file, component folder, or project root")
     p_cap.add_argument("--name", required=True, help="Template name")
     p_cap.add_argument("--tier", choices=["project", "task", "file"], required=True, help="Template tier")
+
+    # obol seed
+    p_seed = sub.add_parser("seed", help="Manage scoped, versioned software seed templates (Project -> Root -> Global)")
+    seed_sub = p_seed.add_subparsers(dest="seed_cmd")
+
+    p_slist = seed_sub.add_parser("list", help="List versioned seed templates across scopes")
+    p_slist.add_argument("--software", help="Filter by software key (e.g. reaper, blender)")
+    p_slist.add_argument("--scope", choices=["project", "client_root", "global", "all"], default="all", help="Scope filter")
+    p_slist.add_argument("--root", help="Client Workspace Root override")
+    p_slist.add_argument("-p", "--project", help="Project name or code")
+    p_slist.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_sres = seed_sub.add_parser("resolve", help="Show which seed template resolves for a software")
+    p_sres.add_argument("software", help="Software key (e.g. reaper, blender)")
+    p_sres.add_argument("--root", help="Client Workspace Root override")
+    p_sres.add_argument("-p", "--project", help="Project name or code")
+    p_sres.add_argument("--override", help="Explicit seed override spec or name")
+    p_sres.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_sadd = seed_sub.add_parser("add", help="Import a file or folder as the next version of a named seed template")
+    p_sadd.add_argument("source", help="Path to starter file or folder bundle")
+    p_sadd.add_argument("--software", required=True, help="Software key (e.g. reaper)")
+    p_sadd.add_argument("--name", default="default", help="Template stream name (default: default)")
+    p_sadd.add_argument("--scope", choices=["client_root", "project", "global"], default="client_root", help="Target scope")
+    p_sadd.add_argument("--root", help="Client Workspace Root override")
+    p_sadd.add_argument("-p", "--project", help="Project name or code (for project scope)")
+    p_sadd.add_argument("-m", "--comment", default="", help="Version note")
+    p_sadd.add_argument("--description", default="", help="Template stream description")
+    p_sadd.add_argument("--tag", action="append", default=[], help="Tag (can be specified multiple times)")
+    p_sadd.add_argument("--set-default", action="store_true", help="Set as default template for this software in scope")
+    p_sadd.add_argument("--no-set-default", action="store_true", help="Do not auto-set as default template")
+    p_sadd.add_argument("--pin-version", action="store_true", help="Pin this new version as the stream default")
+    p_sadd.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_svup = seed_sub.add_parser("version-up", help="Clone an existing seed template version to v(N+1)")
+    p_svup.add_argument("--software", required=True, help="Software key (e.g. reaper)")
+    p_svup.add_argument("--name", default="default", help="Template stream name (default: default)")
+    p_svup.add_argument("--from-version", type=int, help="Source version number (defaults to resolved/latest)")
+    p_svup.add_argument("--scope", choices=["client_root", "project", "global"], default="client_root", help="Target scope")
+    p_svup.add_argument("--root", help="Client Workspace Root override")
+    p_svup.add_argument("-p", "--project", help="Project name or code (for project scope)")
+    p_svup.add_argument("-m", "--comment", default="", help="Version note")
+    p_svup.add_argument("--pin-version", action="store_true", help="Pin this new version as default")
+    p_svup.add_argument("--open", action="store_true", help="Launch the new template version in its software")
+    p_svup.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_sdef = seed_sub.add_parser("set-default", help="Set default template or pin default version for a software")
+    p_sdef.add_argument("--software", required=True, help="Software key (e.g. reaper)")
+    p_sdef.add_argument("--name", default="", help="Template stream name")
+    p_sdef.add_argument("--version", help="Pin version number (e.g. 2) or 'latest' / '0' for Always Latest")
+    p_sdef.add_argument("--clear", action="store_true", help="Clear scope default override so it inherits from parent")
+    p_sdef.add_argument("--scope", choices=["client_root", "project", "global"], default="client_root", help="Target scope")
+    p_sdef.add_argument("--root", help="Client Workspace Root override")
+    p_sdef.add_argument("-p", "--project", help="Project name or code (for project scope)")
+    p_sdef.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_sdel = seed_sub.add_parser("delete", help="Delete a seed template version or entire template stream")
+    p_sdel.add_argument("--software", required=True, help="Software key (e.g. reaper)")
+    p_sdel.add_argument("--name", required=True, help="Template stream name")
+    p_sdel.add_argument("--version", type=int, help="Version number to delete (omit to delete entire stream)")
+    p_sdel.add_argument("--scope", choices=["client_root", "project", "global"], default="client_root", help="Target scope")
+    p_sdel.add_argument("--root", help="Client Workspace Root override")
+    p_sdel.add_argument("-p", "--project", help="Project name or code (for project scope)")
+    p_sdel.add_argument("--json", action="store_true", help="Output JSON")
 
     # obol software
     p_sw = sub.add_parser("software", help="List or configure software profiles and version-up strategies")
@@ -238,6 +304,23 @@ def build_parser() -> argparse.ArgumentParser:
     p_rvup.add_argument("-m", "--comment", default="", help="Version note")
     p_rvup.add_argument("--json", action="store_true", help="Output JSON")
 
+    p_rpw = reap_sub.add_parser("prepare-working", help="Reserve the next working/vNNN/ folder and .rpp filename")
+    p_rpw.add_argument("--rpp", required=True, help="Path to active working .rpp file")
+    p_rpw.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_rrw = reap_sub.add_parser("register-working", help="Register an already-saved working/vNNN/.rpp into Obol")
+    p_rrw.add_argument("--rpp", required=True, help="Path to newly saved working/vNNN/*.rpp file")
+    p_rrw.add_argument("--parent-version", type=int, default=0, help="Parent working version number")
+    p_rrw.add_argument("-m", "--comment", default="", help="Version note")
+    p_rrw.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_rinc = reap_sub.add_parser("increment-save", help="Save the active REAPER session directly as the next working version without reloading")
+    p_rinc.add_argument("--rpp", default="", help="Active REAPER .rpp path (optional when bridge is live)")
+    p_rinc.add_argument("-p", "--project", default="", help="Project name or code override")
+    p_rinc.add_argument("-t", "--task", default="", help="Component path override")
+    p_rinc.add_argument("-m", "--comment", default="", help="Version note")
+    p_rinc.add_argument("--json", action="store_true", help="Output JSON")
+
     p_rcol = reap_sub.add_parser("collect", help="Scan and collect external media referenced in an .rpp into repo/")
     p_rcol.add_argument("--rpp", required=True, help="Path to active working .rpp file")
     p_rcol.add_argument("--json", action="store_true", help="Output JSON")
@@ -257,10 +340,20 @@ def build_parser() -> argparse.ArgumentParser:
     p_rsync.add_argument("--json", action="store_true", help="Output JSON")
 
     p_rui = reap_sub.add_parser("ui", help="Launch a focused Obol PySide6 companion dialog for REAPER")
-    p_rui.add_argument("--mode", choices=["open", "import", "publish", "setup"], required=True, help="Companion dialog mode")
+    p_rui.add_argument("--mode", choices=["open", "import", "update", "publish", "setup"], required=True, help="Companion dialog mode")
     p_rui.add_argument("--rpp", default="", help="Active REAPER .rpp path")
     p_rui.add_argument("-p", "--project", default="", help="Project name override")
     p_rui.add_argument("-c", "--component", default="", help="Component path override")
+
+    p_rupd = reap_sub.add_parser("update-media", help="Scan & update imported MIDI or media takes in REAPER to newer Obol versions")
+    p_rupd.add_argument("--rpp", default="", help="Active REAPER .rpp path (optional when bridge is live; required with --offline)")
+    p_rupd.add_argument("-p", "--project", default="", help="Project name or code override")
+    p_rupd.add_argument("--check", action="store_true", help="Scan and report outdated takes without modifying REAPER or .rpp")
+    p_rupd.add_argument("--offline", action="store_true", help="Scan/relink FILE references in --rpp on disk instead of live bridge")
+    p_rupd.add_argument("--mode", choices=["replace_source", "add_take"], default="replace_source", help="Take update mode (default: replace_source)")
+    p_rupd.add_argument("--midi-mode", choices=["preserve", "in_project", "file_ref"], default="preserve", help="MIDI storage behavior (default: preserve)")
+    p_rupd.add_argument("--match-length", choices=["auto", "always", "never"], default="auto", help="Resize item length behavior (default: auto)")
+    p_rupd.add_argument("--json", action="store_true", help="Output JSON")
 
     # obol resolve
     p_dvr = sub.add_parser("resolve", help="DaVinci Resolve bridge, Lua script installer, and session helpers")
@@ -312,8 +405,106 @@ def build_parser() -> argparse.ArgumentParser:
     p_dui.add_argument("-p", "--project", default="", help="Project name override")
     p_dui.add_argument("-c", "--component", default="", help="Component path override")
 
+    # obol filmcraft
+    p_fc = sub.add_parser("filmcraft", help="FilmCraft NLE bridge, headless CLI automation, and session helpers")
+    fc_sub = p_fc.add_subparsers(dest="filmcraft_cmd")
+
+    p_fstat = fc_sub.add_parser("status", help="Inspect FilmCraft integration, CLI engine, and live bridge status")
+    p_fstat.add_argument("--install-dir", help="Override FilmCraft install folder")
+    p_fstat.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_finst = fc_sub.add_parser("install", help="Configure FilmCraft Obol bridge & launcher")
+    p_finst.add_argument("--install-dir", help="Override FilmCraft install folder")
+    p_finst.add_argument("--exe", default="", help="Optional path to filmcraft.exe")
+    p_finst.add_argument("--port", type=int, default=47420, help="TCP control server port (default: 47420)")
+    p_finst.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_funinst = fc_sub.add_parser("uninstall", help="Remove FilmCraft bridge configuration and launcher")
+    p_funinst.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_flaunch = fc_sub.add_parser("launch", help="Launch FilmCraft (with --control bridge enabled by default)")
+    p_flaunch.add_argument("--fcproj", default="", help="Optional .fcproj file to open")
+    p_flaunch.add_argument("--no-control", action="store_true", help="Launch without --control port")
+
+    p_fctx = fc_sub.add_parser("context", help="Resolve an .fcproj path to its Obol project, component, and working version")
+    p_fctx.add_argument("--fcproj", required=True, help="Path to .fcproj file")
+    p_fctx.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_finsp = fc_sub.add_parser("inspect", help="Inspect a .fcproj file or live FilmCraft session")
+    p_finsp.add_argument("--fcproj", default="", help="Path to .fcproj file (omit to query live --control bridge)")
+    p_finsp.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_fpres = fc_sub.add_parser("presets", help="List available FilmCraft export presets")
+    p_fpres.add_argument("query", nargs="?", default="", help="Optional preset filter query")
+    p_fpres.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_fvup = fc_sub.add_parser("version-up", help="Version up the Obol component owning the given .fcproj file")
+    p_fvup.add_argument("--fcproj", required=True, help="Path to active working .fcproj file")
+    p_fvup.add_argument("-m", "--comment", default="", help="Version note")
+    p_fvup.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_fcol = fc_sub.add_parser("collect", help="Scan and collect external media referenced in an .fcproj into repo/")
+    p_fcol.add_argument("--fcproj", required=True, help="Path to active working .fcproj file")
+    p_fcol.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_fimp = fc_sub.add_parser("import", help="Import media file(s) into a FilmCraft .fcproj or live session")
+    p_fimp.add_argument("files", nargs="+", help="Media file path(s) to import")
+    p_fimp.add_argument("--fcproj", default="", help="Target .fcproj path (omit to use live --control bridge)")
+    p_fimp.add_argument("--bin", default="", help="Target project bin path (e.g. 'Obol/video/repo')")
+    p_fimp.add_argument("--place", action="store_true", help="Also place imported media onto the active timeline")
+    p_fimp.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_fexp = fc_sub.add_parser("export", help="Export sequence media from FilmCraft directly into published/<name>/vNNN/")
+    p_fexp.add_argument("-p", "--project", help="Project name or code")
+    p_fexp.add_argument("-t", "--task", help="Component path (inferred from --fcproj when omitted)")
+    p_fexp.add_argument("--fcproj", default="", help="Target .fcproj path (omit to use live --control bridge)")
+    p_fexp.add_argument("--name", default="main", help="Deliverable name (default: main)")
+    p_fexp.add_argument("--into-version", type=int, help="Target existing published version number")
+    p_fexp.add_argument("--preset", default="", help="FilmCraft export preset name")
+    p_fexp.add_argument("--format", default="h264", help="Export format when no preset is specified (default: h264)")
+    p_fexp.add_argument("--sequence", type=int, help="Target sequence item ID")
+    p_fexp.add_argument("--range", default="entire", choices=["entire", "inOut", "workArea", "custom"], help="Export range")
+    p_fexp.add_argument("--start", type=float, help="Custom range start in seconds")
+    p_fexp.add_argument("--end", type=float, help="Custom range end in seconds")
+    p_fexp.add_argument("--scale", type=float, help="Resolution scale factor (e.g. 0.5)")
+    p_fexp.add_argument("--quality", type=int, help="Quality 0-100")
+    p_fexp.add_argument("--no-audio", action="store_true", help="Omit audio")
+    p_fexp.add_argument("--allow-offline", action="store_true", help="Allow offline placeholder frames")
+    p_fexp.add_argument("-m", "--comment", default="", help="Release note")
+    p_fexp.add_argument("--tag", action="append", default=[], help="Tag (can be specified multiple times)")
+    p_fexp.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_fstill = fc_sub.add_parser("render-still", help="Render a single PNG frame from FilmCraft into published/<name>/vNNN/")
+    p_fstill.add_argument("-p", "--project", help="Project name or code")
+    p_fstill.add_argument("-t", "--task", help="Component path (inferred from --fcproj when omitted)")
+    p_fstill.add_argument("--fcproj", default="", help="Target .fcproj path (omit to use live --control bridge)")
+    p_fstill.add_argument("--name", default="still", help="Deliverable name (default: still)")
+    p_fstill.add_argument("--seconds", type=float, default=0.0, help="Frame timestamp in seconds")
+    p_fstill.add_argument("--scale", type=float, help="Resolution scale factor")
+    p_fstill.add_argument("--allow-offline", action="store_true", help="Allow offline placeholder media")
+    p_fstill.add_argument("-m", "--comment", default="", help="Release note")
+    p_fstill.add_argument("--tag", action="append", default=[], help="Tag (can be specified multiple times)")
+    p_fstill.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_fint = fc_sub.add_parser("interchange", help="Export XML/FCPXML/EDL/OTIO/AAF/OMF interchange into published/<name>/vNNN/")
+    p_fint.add_argument("-p", "--project", help="Project name or code")
+    p_fint.add_argument("-t", "--task", help="Component path (inferred from --fcproj when omitted)")
+    p_fint.add_argument("--fcproj", default="", help="Target .fcproj path (omit to use live --control bridge)")
+    p_fint.add_argument("--name", default="interchange", help="Deliverable name (default: interchange)")
+    p_fint.add_argument("--format", default="xml", choices=["edl", "xml", "fcpxml", "otio", "aaf", "omf"], help="Interchange format")
+    p_fint.add_argument("--sequence", type=int, help="Target sequence item ID")
+    p_fint.add_argument("-m", "--comment", default="", help="Release note")
+    p_fint.add_argument("--tag", action="append", default=[], help="Tag (can be specified multiple times)")
+    p_fint.add_argument("--json", action="store_true", help="Output JSON")
+
+    p_fui = fc_sub.add_parser("ui", help="Launch a focused Obol PySide6 companion dialog for FilmCraft")
+    p_fui.add_argument("--mode", choices=["import", "publish", "setup"], required=True, help="Companion dialog mode")
+    p_fui.add_argument("--fcproj", default="", help="Active FilmCraft .fcproj path")
+    p_fui.add_argument("-p", "--project", default="", help="Project name override")
+    p_fui.add_argument("-c", "--component", default="", help="Component path override")
+
     # obol integrations
-    p_int = sub.add_parser("integrations", help="Unified DCC integration manager (REAPER, DaVinci Resolve)")
+    p_int = sub.add_parser("integrations", help="Unified DCC integration manager (REAPER, DaVinci Resolve, FilmCraft)")
     int_sub = p_int.add_subparsers(dest="int_cmd")
 
     p_istat = int_sub.add_parser("status", help="Show health, drift, and bridge status for all DCC integrations")
@@ -321,22 +512,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_istat.add_argument("--json", action="store_true", help="Output JSON")
 
     p_iinst = int_sub.add_parser("install", help="Install or update one or all detected DCC integrations")
-    p_iinst.add_argument("dcc", nargs="?", choices=["reaper", "resolve"], help="DCC key (omit with --all)")
+    p_iinst.add_argument("dcc", nargs="?", choices=["reaper", "resolve", "filmcraft"], help="DCC key (omit with --all)")
     p_iinst.add_argument("--all", action="store_true", help="Install or update all detected DCCs")
-    p_iinst.add_argument("--target-dir", help="Override target resource/scripts directory for a single DCC")
+    p_iinst.add_argument("--target-dir", help="Override target resource/scripts/install directory for a single DCC")
     p_iinst.add_argument("--exe", default="", help="Optional executable path override")
     p_iinst.add_argument("--no-autostart", action="store_true", help="REAPER: do not add __startup.lua bridge hook")
     p_iinst.add_argument("--no-studio-api", action="store_true", help="Skip external Resolve Studio API check")
     p_iinst.add_argument("--json", action="store_true", help="Output JSON")
 
     p_iuninst = int_sub.add_parser("uninstall", help="Uninstall a DCC integration")
-    p_iuninst.add_argument("dcc", choices=["reaper", "resolve"], help="DCC key to uninstall")
-    p_iuninst.add_argument("--target-dir", help="Override target resource/scripts directory")
+    p_iuninst.add_argument("dcc", choices=["reaper", "resolve", "filmcraft"], help="DCC key to uninstall")
+    p_iuninst.add_argument("--target-dir", help="Override target resource/scripts/install directory")
     p_iuninst.add_argument("--no-studio-api", action="store_true", help="Skip external Resolve Studio API check")
     p_iuninst.add_argument("--json", action="store_true", help="Output JSON")
 
     p_iui = int_sub.add_parser("ui", help="Launch the unified DCC Integrations Manager window")
-    p_iui.add_argument("--dcc", default="", choices=["", "reaper", "resolve"], help="Initial DCC to select")
+    p_iui.add_argument("--dcc", default="", choices=["", "reaper", "resolve", "filmcraft"], help="Initial DCC to select")
 
     # obol gui
     p_gui = sub.add_parser("gui", help="Launch the 3-Pane Obol Desktop GUI")
@@ -402,7 +593,13 @@ def run_cli(argv: Optional[list[str]] = None, hub: Optional[ObolHub] = None) -> 
     if args.command == "task":
         pname, proot = _resolve_project_root(active_hub, getattr(args, "project", None))
         if args.task_cmd == "create":
-            snap = ws.create_component(proot, args.component_path, task_template=args.template)
+            snap = ws.create_component(
+                proot,
+                args.component_path,
+                task_template=args.template,
+                software_override=getattr(args, "software", None),
+                seed_override=getattr(args, "seed", None),
+            )
             print(f"Created component '{snap.component_path}' in project '{pname}' (software: {snap.software})")
             return 0
         for comp in discover_project_components(proot):
@@ -508,8 +705,212 @@ def run_cli(argv: Optional[list[str]] = None, hub: Optional[ObolHub] = None) -> 
             return 0
         print("Tier-1 Project Templates:", ", ".join(tm.list_project_templates().keys()))
         print("Tier-2 Task Templates:   ", ", ".join(tm.list_task_templates().keys()))
-        print("Tier-3 Seed Files:       ", ", ".join(tm.list_file_templates().keys()))
+        print("Tier-3 Legacy Seeds:     ", ", ".join(tm.list_file_templates().keys()))
+        croot = active_hub.get_client_root()
+        root_sw = tm.seeds.list_scope_software(TemplateScope.CLIENT_ROOT, client_root=croot)
+        if root_sw:
+            summaries = []
+            for sw_k in root_sw:
+                man = tm.seeds.load_manifest(sw_k, TemplateScope.CLIENT_ROOT, client_root=croot)
+                summaries.append(f"{sw_k}:{man.default_template or '(inherit)'}")
+            print(f"Root Seeds ({croot}):", ", ".join(summaries))
         return 0
+
+    if args.command == "seed":
+        tm = active_hub.template_manager
+
+        def _seed_ctx(scope_str: str, root_arg: Optional[str], proj_arg: Optional[str]) -> tuple[TemplateScope, Optional[Path], Optional[Path]]:
+            sc = TemplateScope(scope_str)
+            croot = Path(root_arg).expanduser().resolve() if root_arg else active_hub.get_client_root()
+            proot: Optional[Path] = None
+            if sc == TemplateScope.PROJECT or proj_arg:
+                _, proot = _resolve_project_root(active_hub, proj_arg)
+            return sc, proot, croot
+
+        if args.seed_cmd == "list" or not args.seed_cmd:
+            scope_arg = getattr(args, "scope", "all")
+            root_arg = getattr(args, "root", None)
+            proj_arg = getattr(args, "project", None)
+            sw_filter = getattr(args, "software", None)
+            as_json = getattr(args, "json", False)
+
+            croot = Path(root_arg).expanduser().resolve() if root_arg else active_hub.get_client_root()
+            proot: Optional[Path] = None
+            if proj_arg:
+                _, proot = _resolve_project_root(active_hub, proj_arg)
+            elif scope_arg == "project":
+                _, proot = _resolve_project_root(active_hub, None)
+
+            scopes = (
+                [TemplateScope.PROJECT, TemplateScope.CLIENT_ROOT, TemplateScope.GLOBAL]
+                if scope_arg == "all"
+                else [TemplateScope(scope_arg)]
+            )
+            payload: list[dict[str, Any]] = []
+            for sc in scopes:
+                if sc == TemplateScope.PROJECT and proot is None:
+                    continue
+                sw_list = [sw_filter] if sw_filter else tm.seeds.list_scope_software(sc, project_root=proot, client_root=croot)
+                for sw_k in sw_list:
+                    man = tm.seeds.load_manifest(sw_k, sc, project_root=proot, client_root=croot)
+                    if not man.templates and not man.default_template:
+                        continue
+                    payload.append({
+                        "scope": sc.value,
+                        "scope_root": str(tm.seeds.get_scope_root(sc, project_root=proot, client_root=croot)),
+                        "software": man.software,
+                        "default_template": man.default_template,
+                        "templates": {k: v.to_dict() for k, v in sorted(man.templates.items())},
+                    })
+            if as_json:
+                print(json.dumps({"ok": True, "scopes": payload}))
+            else:
+                if not payload:
+                    print("No scoped versioned seed templates configured.")
+                for entry in payload:
+                    print(f"[{entry['scope']}] {entry['software']} (default: {entry['default_template'] or 'inherit'}) @ {entry['scope_root']}")
+                    for tname, tdata in entry["templates"].items():
+                        pin = f"pinned v{tdata['default_version']:03d}" if tdata.get("default_version", 0) > 0 else "latest"
+                        vers = ", ".join(f"v{v['version']:03d}" for v in tdata.get("versions", []))
+                        mark = "*" if tname == entry["default_template"] else " "
+                        print(f"  {mark} {tname} ({pin}) [{vers}]")
+            return 0
+
+        if args.seed_cmd == "resolve":
+            croot = Path(args.root).expanduser().resolve() if args.root else active_hub.get_client_root()
+            proot: Optional[Path] = None
+            if args.project:
+                _, proot = _resolve_project_root(active_hub, args.project)
+            res = tm.resolve_seed_template(
+                software=args.software,
+                project_root=proot,
+                client_root=croot,
+                seed_override=args.override,
+            )
+            if args.json:
+                print(
+                    json.dumps({
+                        "found": res is not None,
+                        "software": args.software,
+                        "scope": res.scope.value if res else None,
+                        "template_name": res.template_name if res else None,
+                        "version": res.version if res else None,
+                        "primary_file": str(res.primary_file) if res else None,
+                        "spec": res.reference_spec() if res else None,
+                        "label": res.display_label() if res else None,
+                    })
+                )
+            else:
+                if res is None:
+                    print(f"No seed template resolved for '{args.software}'.")
+                else:
+                    print(f"{res.display_label()} -> {res.primary_file} ({res.reference_spec()})")
+            return 0
+
+        if args.seed_cmd == "add":
+            sc, proot, croot = _seed_ctx(args.scope, args.root, args.project)
+            prof = active_hub.get_software_profile(args.software)
+            set_def: Optional[bool] = True if args.set_default else (False if args.no_set_default else None)
+            stream, ver = tm.seeds.add_version(
+                software=args.software,
+                template_name=args.name,
+                source_path=Path(args.source),
+                scope=sc,
+                comment=args.comment,
+                author=active_hub.config.author_name,
+                description=args.description or None,
+                tags=args.tag,
+                set_as_default_template=set_def,
+                set_as_default_version=args.pin_version,
+                project_root=proot,
+                client_root=croot,
+                ignore_patterns=prof.ignore_patterns,
+                lock_previous=prof.lock_previous_versions,
+                preferred_extensions=prof.extensions,
+            )
+            if args.json:
+                print(json.dumps({"ok": True, "scope": sc.value, "software": stream.software, "name": stream.name, "version": ver.version, "primary_file": ver.primary_file}))
+            else:
+                print(f"Added [{sc.value}] {stream.software}/{stream.name} {ver.version_label} -> {ver.primary_file}")
+            return 0
+
+        if args.seed_cmd == "version-up":
+            sc, proot, croot = _seed_ctx(args.scope, args.root, args.project)
+            prof = active_hub.get_software_profile(args.software)
+            stream, ver = tm.seeds.version_up_template(
+                software=args.software,
+                template_name=args.name,
+                scope=sc,
+                source_version=args.from_version,
+                comment=args.comment,
+                author=active_hub.config.author_name,
+                set_as_default_version=args.pin_version,
+                project_root=proot,
+                client_root=croot,
+                ignore_patterns=prof.ignore_patterns,
+                lock_previous=prof.lock_previous_versions,
+                preferred_extensions=prof.extensions,
+            )
+            sw_dir = tm.seeds.get_seeds_dir(sc, project_root=proot, client_root=croot) / stream.software
+            p_abs = sw_dir / ver.primary_file
+            if args.open and p_abs.is_file():
+                from obol.plugins.base import launch_file_with_profile
+
+                launch_file_with_profile(p_abs, prof)
+            if args.json:
+                print(json.dumps({"ok": True, "scope": sc.value, "software": stream.software, "name": stream.name, "version": ver.version, "primary_file": str(p_abs)}))
+            else:
+                print(f"Created [{sc.value}] {stream.software}/{stream.name} {ver.version_label} -> {p_abs}")
+            return 0
+
+        if args.seed_cmd == "set-default":
+            sc, proot, croot = _seed_ctx(args.scope, args.root, args.project)
+            if args.clear:
+                man = tm.seeds.set_default_template(args.software, "", sc, project_root=proot, client_root=croot)
+                if args.json:
+                    print(json.dumps({"ok": True, "scope": sc.value, "software": man.software, "default_template": ""}))
+                else:
+                    print(f"Cleared default template override for [{sc.value}] {man.software} (now inherits from parent scope)")
+                return 0
+
+            tname = args.name
+            if args.version is not None:
+                if not tname:
+                    man = tm.seeds.load_manifest(args.software, sc, project_root=proot, client_root=croot)
+                    tname = man.default_template or "default"
+                ver_num = 0 if str(args.version).strip().lower() in ("latest", "auto", "0") else int(args.version)
+                stream = tm.seeds.set_default_version(args.software, tname, ver_num, sc, project_root=proot, client_root=croot)
+                if args.name:
+                    tm.seeds.set_default_template(args.software, tname, sc, project_root=proot, client_root=croot)
+                if args.json:
+                    print(json.dumps({"ok": True, "scope": sc.value, "software": stream.software, "name": stream.name, "default_version": stream.default_version}))
+                else:
+                    mode = f"v{stream.default_version:03d}" if stream.default_version > 0 else "Always Latest"
+                    print(f"Set [{sc.value}] {stream.software}/{stream.name} default version -> {mode}")
+                return 0
+
+            if not tname:
+                raise SystemExit("Error: Pass --name <template_name>, --version <N|latest>, or --clear.")
+            man = tm.seeds.set_default_template(args.software, tname, sc, project_root=proot, client_root=croot)
+            if args.json:
+                print(json.dumps({"ok": True, "scope": sc.value, "software": man.software, "default_template": man.default_template}))
+            else:
+                print(f"Set [{sc.value}] {man.software} default template -> '{man.default_template}'")
+            return 0
+
+        if args.seed_cmd == "delete":
+            sc, proot, croot = _seed_ctx(args.scope, args.root, args.project)
+            if args.version is not None:
+                ok = tm.seeds.delete_version(args.software, args.name, args.version, sc, project_root=proot, client_root=croot)
+            else:
+                ok = tm.seeds.delete_template(args.software, args.name, sc, project_root=proot, client_root=croot)
+            if not ok:
+                raise SystemExit("Error: Target seed template or version not found.")
+            if args.json:
+                print(json.dumps({"ok": True, "deleted": True}))
+            else:
+                print(f"Deleted [{sc.value}] {args.software}/{args.name}" + (f" v{args.version:03d}" if args.version else ""))
+            return 0
 
     if args.command == "software":
         if args.sw_cmd == "set":
@@ -650,6 +1051,260 @@ def run_cli(argv: Optional[list[str]] = None, hub: Optional[ObolHub] = None) -> 
                 component=args.component,
             )
 
+        if args.reaper_cmd == "increment-save":
+            from obol.plugins.reaper_bridge import ReaperBridgeClient
+
+            bridge = ReaperBridgeClient(active_hub)
+            if not bridge.is_connected():
+                err = {"ok": False, "error": "REAPER bridge is offline. Start REAPER with Obol Bridge running."}
+                if args.json:
+                    print(json.dumps(err))
+                    return 1
+                raise SystemExit(f"Error: {err['error']}")
+
+            st = bridge.get_state()
+            cand_rpp = str(getattr(args, "rpp", "") or "").strip() or st.active_rpp
+            ctx_inc = ws.resolve_working_file_context(Path(cand_rpp)) if cand_rpp else None
+
+            if ctx_inc is not None and not getattr(args, "project", "") and not getattr(args, "task", ""):
+                target_proot = ctx_inc.project_root
+                target_comp = ctx_inc.component_path
+                src_ver: Optional[int] = ctx_inc.working_version
+            else:
+                _, target_proot = _resolve_project_root(active_hub, getattr(args, "project", "") or None)
+                target_comp = str(getattr(args, "task", "") or (ctx_inc.component_path if ctx_inc else "")).strip()
+                if not target_comp:
+                    err = {"ok": False, "error": "Could not determine component path. Pass -t/--task or open an Obol working .rpp."}
+                    if args.json:
+                        print(json.dumps(err))
+                        return 1
+                    raise SystemExit(f"Error: {err['error']}")
+                src_ver = ctx_inc.working_version if (ctx_inc and ctx_inc.component_path == target_comp) else None
+
+            prep = ws.prepare_next_working_version(
+                target_proot,
+                target_comp,
+                source_version=src_ver,
+                extension=".rpp",
+            )
+            target_rpp = Path(prep["primary_file"])
+            ver_dir = Path(prep["version_dir"])
+            try:
+                save_res = bridge.save_project_as(target_rpp, ensure_open=True)
+                if not target_rpp.is_file():
+                    raise FileNotFoundError(f"REAPER did not create target file: {target_rpp}")
+            except Exception as exc:
+                if ver_dir.is_dir() and not any(ver_dir.iterdir()):
+                    ver_dir.rmdir()
+                err = {"ok": False, "error": str(exc)}
+                if args.json:
+                    print(json.dumps(err))
+                    return 1
+                raise SystemExit(f"Error: {err['error']}")
+
+            bundle = ws.register_saved_working_version(
+                target_proot,
+                target_comp,
+                version=int(prep["version"]),
+                primary_file=target_rpp,
+                parent_version=int(prep["parent_version"]),
+                comment=args.comment or f"Increment saved from REAPER ({prep['version_label']})",
+            )
+            primary_abs = (target_proot / target_comp / bundle.primary_file).resolve()
+            res = {
+                "ok": True,
+                "version": bundle.version,
+                "version_label": bundle.version_label,
+                "parent_version": bundle.parent_version,
+                "primary_file": str(primary_abs),
+                "component_path": target_comp,
+                "active_rpp": str(save_res.get("active_rpp") or primary_abs),
+                "switched_in_place": bool(save_res.get("switched_in_place", True)),
+                "reloaded": bool(save_res.get("reloaded", False)),
+            }
+            if args.json:
+                print(json.dumps(res))
+            else:
+                print(f"Increment saved {target_comp}/{bundle.folder_rel} -> {primary_abs}")
+            return 0
+
+        if args.reaper_cmd == "update-media":
+            from obol.plugins.reaper import ReaperPlugin
+            from obol.plugins.reaper_bridge import ReaperBridgeClient
+
+            rpp_arg = str(getattr(args, "rpp", "") or "").strip()
+            rpp_cand = Path(rpp_arg) if rpp_arg else None
+            ctx_rpp = ws.resolve_working_file_context(rpp_cand) if (rpp_cand and rpp_cand.is_file()) else None
+            proot: Optional[Path] = None
+            if getattr(args, "project", ""):
+                _, proot = _resolve_project_root(active_hub, args.project)
+            elif ctx_rpp is not None:
+                proot = ctx_rpp.project_root
+            else:
+                try:
+                    _, proot = _resolve_project_root(active_hub, None)
+                except SystemExit:
+                    proot = None
+
+            if args.offline:
+                if not rpp_cand or not rpp_cand.is_file() or proot is None:
+                    err = {"ok": False, "error": "--offline requires a valid --rpp inside an Obol project (or pass -p/--project)."}
+                    if args.json:
+                        print(json.dumps(err))
+                        return 1
+                    raise SystemExit(f"Error: {err['error']}")
+                refs = ReaperPlugin.find_outdated_rpp_references(rpp_cand, proot, ws)
+                outdated = [r for r in refs if r.get("update_available")]
+                updated_count = 0
+                if not args.check and outdated:
+                    upd_res = ReaperPlugin.update_rpp_references(rpp_cand, proot, ws)
+                    updated_count = int(upd_res.get("updated_count", 0))
+                payload = {
+                    "ok": True,
+                    "mode": "offline",
+                    "rpp": str(rpp_cand.resolve()),
+                    "matched_count": len(refs),
+                    "outdated_count": len(outdated),
+                    "updated_count": updated_count,
+                    "checked_only": bool(args.check),
+                    "items": [
+                        {
+                            "component": r["component"],
+                            "kind": r["kind"],
+                            "asset_key": r["asset_key"],
+                            "media_kind": r.get("media_kind", "media"),
+                            "current_version": r["current_version"],
+                            "latest_version": r["latest_version"],
+                            "update_available": bool(r["update_available"]),
+                            "raw_reference": r["raw_reference"],
+                            "latest_file": str(r["latest_file"]),
+                        }
+                        for r in refs
+                    ],
+                }
+                if args.json:
+                    print(json.dumps(payload))
+                else:
+                    print(
+                        f"Offline .rpp scan ({rpp_cand.name}): {len(refs)} tracked reference(s), "
+                        f"{len(outdated)} outdated, {updated_count} relinked."
+                    )
+                return 0
+
+            bridge = ReaperBridgeClient(active_hub)
+            if not bridge.is_connected():
+                if rpp_cand and rpp_cand.is_file() and proot is not None:
+                    refs = ReaperPlugin.find_outdated_rpp_references(rpp_cand, proot, ws)
+                    outdated = [r for r in refs if r.get("update_available")]
+                    updated_count = 0
+                    if not args.check and outdated:
+                        upd_res = ReaperPlugin.update_rpp_references(rpp_cand, proot, ws)
+                        updated_count = int(upd_res.get("updated_count", 0))
+                    payload = {
+                        "ok": True,
+                        "mode": "offline_fallback",
+                        "rpp": str(rpp_cand.resolve()),
+                        "matched_count": len(refs),
+                        "outdated_count": len(outdated),
+                        "updated_count": updated_count,
+                        "checked_only": bool(args.check),
+                    }
+                    if args.json:
+                        print(json.dumps(payload))
+                    else:
+                        print(f"Bridge offline; .rpp scan ({rpp_cand.name}): {len(outdated)} outdated, {updated_count} relinked.")
+                    return 0
+                err = {"ok": False, "error": "REAPER bridge is offline. Open REAPER with Obol Bridge or pass --offline --rpp <path>."}
+                if args.json:
+                    print(json.dumps(err))
+                    return 1
+                raise SystemExit(f"Error: {err['error']}")
+
+            st = bridge.get_state()
+            if proot is None and st.active_rpp:
+                act_ctx = ws.resolve_working_file_context(Path(st.active_rpp))
+                if act_ctx is not None:
+                    proot = act_ctx.project_root
+
+            session_items = bridge.query_session_media()
+            resolved_items: list[dict[str, Any]] = []
+            for sit in session_items:
+                info = ws.resolve_reaper_session_item(proot, sit)
+                if info is not None:
+                    resolved_items.append(info)
+
+            outdated_items = [it for it in resolved_items if it.get("update_available")]
+            take_updates: list[dict[str, Any]] = []
+            replacements: dict[str, str] = {}
+            for it in outdated_items:
+                latest_path = Path(str(it["latest_file"]))
+                curr_path = Path(str(it["current_file"]))
+                replacements[str(curr_path)] = str(latest_path)
+                meta_root = str(proot.resolve()) if proot else str((it.get("obol_ext") or {}).get("project_root") or "")
+                take_updates.append({
+                    "take_guid": str(it.get("take_guid") or ""),
+                    "item_guid": str(it.get("item_guid") or ""),
+                    "old_path": str(curr_path),
+                    "target_path": str(latest_path),
+                    "asset_meta": {
+                        "project_root": meta_root,
+                        "scope": str(it["kind"]),
+                        "component": str(it["component"]),
+                        "asset_key": str(it["asset_key"]),
+                        "version": int(it["latest_version"]),
+                        "file_path": str(latest_path.resolve()),
+                        "file_name": latest_path.name,
+                        "media_kind": str(it.get("media_kind") or ("midi" if latest_path.suffix.lower() in (".mid", ".midi") else "media")),
+                    },
+                })
+
+            upd_result: dict[str, Any] = {}
+            if not args.check and take_updates:
+                upd_result = bridge.update_media_sources(
+                    replacements=replacements,
+                    take_updates=take_updates,
+                    update_mode=args.mode,
+                    midi_mode=args.midi_mode,
+                    match_length=args.match_length,
+                )
+
+            payload = {
+                "ok": True,
+                "mode": "live",
+                "session_takes": len(session_items),
+                "matched_count": len(resolved_items),
+                "outdated_count": len(outdated_items),
+                "updated_takes": int(upd_result.get("updated_takes", 0)),
+                "updated_items": int(upd_result.get("updated_items", 0)),
+                "updated_midi_takes": int(upd_result.get("updated_midi_takes", 0)),
+                "updated_media_takes": int(upd_result.get("updated_media_takes", 0)),
+                "checked_only": bool(args.check),
+                "items": [
+                    {
+                        "track_name": it.get("track_name", ""),
+                        "take_name": it.get("take_name", ""),
+                        "is_midi": bool(it.get("is_midi")),
+                        "midi_storage": it.get("midi_storage", ""),
+                        "matched_by": it.get("matched_by", ""),
+                        "component": it["component"],
+                        "kind": it["kind"],
+                        "asset_key": it["asset_key"],
+                        "current_version": it["current_version"],
+                        "latest_version": it["latest_version"],
+                        "update_available": bool(it["update_available"]),
+                    }
+                    for it in resolved_items
+                ],
+            }
+            if args.json:
+                print(json.dumps(payload))
+            else:
+                print(
+                    f"REAPER session scan: {len(resolved_items)} Obol asset take(s), "
+                    f"{len(outdated_items)} outdated, {payload['updated_takes']} take(s) updated."
+                )
+            return 0
+
         rpp_path = Path(args.rpp)
         ctx = ws.resolve_working_file_context(rpp_path)
 
@@ -700,6 +1355,54 @@ def run_cli(argv: Optional[list[str]] = None, hub: Optional[ObolHub] = None) -> 
                 print(json.dumps(res))
             else:
                 print(f"Created {ctx.component_path}/{bundle.folder_rel} -> {primary_abs}")
+            return 0
+
+        if args.reaper_cmd == "prepare-working":
+            prep = ws.prepare_next_working_version(
+                project_root=ctx.project_root,
+                component_path=ctx.component_path,
+                source_version=ctx.working_version,
+                extension=rpp_path.suffix or ".rpp",
+            )
+            res = {
+                "ok": True,
+                "version": prep["version"],
+                "version_label": prep["version_label"],
+                "parent_version": prep["parent_version"],
+                "folder_rel": prep["folder_rel"],
+                "version_dir": str(prep["version_dir"]),
+                "primary_file": str(prep["primary_file"]),
+                "primary_rel": prep["primary_rel"],
+                "component_path": ctx.component_path,
+            }
+            if args.json:
+                print(json.dumps(res))
+            else:
+                print(str(prep["primary_file"]))
+            return 0
+
+        if args.reaper_cmd == "register-working":
+            bundle = ws.register_saved_working_version(
+                project_root=ctx.project_root,
+                component_path=ctx.component_path,
+                version=ctx.working_version,
+                primary_file=rpp_path,
+                parent_version=int(getattr(args, "parent_version", 0) or 0),
+                comment=args.comment,
+            )
+            primary_abs = (ctx.project_root / ctx.component_path / bundle.primary_file).resolve()
+            res = {
+                "ok": True,
+                "version": bundle.version,
+                "version_label": bundle.version_label,
+                "parent_version": bundle.parent_version,
+                "primary_file": str(primary_abs),
+                "component_path": ctx.component_path,
+            }
+            if args.json:
+                print(json.dumps(res))
+            else:
+                print(f"Registered {ctx.component_path}/{bundle.folder_rel} -> {primary_abs}")
             return 0
 
         if args.reaper_cmd == "collect":
@@ -905,6 +1608,279 @@ def run_cli(argv: Optional[list[str]] = None, hub: Optional[ObolHub] = None) -> 
             else:
                 print(f"Synced published/{deliv_path}/{bundle.version_label} ({len(bundle.files)} file(s))")
             return 0
+
+    if args.command == "filmcraft":
+        from obol.plugins.filmcraft_bridge import FilmCraftBridgeClient
+        from obol.plugins.filmcraft_installer import FilmCraftInstaller
+
+        installer = FilmCraftInstaller(active_hub)
+        bridge = FilmCraftBridgeClient(active_hub)
+        idir = Path(args.install_dir) if getattr(args, "install_dir", None) else None
+
+        if args.filmcraft_cmd == "status" or not args.filmcraft_cmd:
+            st = installer.status(install_dir=idir, query_live=False)
+            if getattr(args, "json", False):
+                print(json.dumps(st))
+            else:
+                print(f"FilmCraft Install Dir: {st['install_dir'] or 'Not found'} (exists={st['install_dir_exists']})")
+                print(f"FilmCraft Executable:  {st['executable'] or 'Not configured'} (exists={st['executable_exists']})")
+                print(f"FilmCraft CLI:         {st['cli_executable'] or 'Not found'} ({st['cli_version'] or 'n/a'})")
+                print(f"Bridge Config Sync:    {st['config_in_sync']} ({st['config_detail']})")
+                print(f"Live Control Bridge:   {st['bridge_connected']} ({st['control_host']}:{st['control_port']})")
+            return 0
+
+        if args.filmcraft_cmd == "install":
+            st = installer.install(
+                install_dir=idir,
+                executable_override=args.exe,
+                control_port=args.port,
+            )
+            if args.json:
+                print(json.dumps({"ok": True, "status": st}))
+            else:
+                print(f"Configured FilmCraft integration ({st['install_dir']}) on port {st['control_port']}")
+            return 0
+
+        if args.filmcraft_cmd == "uninstall":
+            st = installer.uninstall()
+            if args.json:
+                print(json.dumps({"ok": True, "status": st}))
+            else:
+                print("Removed FilmCraft bridge configuration and launcher.")
+            return 0
+
+        if args.filmcraft_cmd == "launch":
+            fc_path = Path(args.fcproj) if args.fcproj else None
+            proc = bridge.launch_app(fcproj_path=fc_path, with_control=not args.no_control)
+            print(f"Launched FilmCraft (pid={proc.pid}, control={not args.no_control})")
+            return 0
+
+        if args.filmcraft_cmd == "presets":
+            presets = bridge.list_export_presets(args.query)
+            if args.json:
+                print(json.dumps({"presets": presets}))
+            else:
+                for pr in presets:
+                    print(f"- [{pr.get('category', '')}] {pr.get('name', '')} (.{pr.get('extension', '')})")
+            return 0
+
+        if args.filmcraft_cmd == "ui":
+            from obol.gui.filmcraft_dialogs import launch_filmcraft_dialog
+
+            return launch_filmcraft_dialog(
+                hub=active_hub,
+                mode=args.mode,
+                active_fcproj=args.fcproj,
+                project=args.project,
+                component=args.component,
+            )
+
+        if args.filmcraft_cmd == "inspect":
+            fc_path = Path(args.fcproj) if args.fcproj else None
+            res = bridge.inspect_project(project_path=fc_path)
+            print(json.dumps(res, indent=2 if not args.json else None))
+            return 0
+
+        if args.filmcraft_cmd == "import":
+            fc_path = Path(args.fcproj) if args.fcproj else None
+            res = bridge.import_media(
+                [Path(f) for f in args.files],
+                bin_path=args.bin,
+                place_on_timeline=args.place,
+                project_path=fc_path,
+            )
+            if args.json:
+                print(json.dumps({"ok": True, **res}))
+            else:
+                print(f"Imported {res.get('imported', len(args.files))} file(s) into bin '{res.get('bin', 'Root')}'")
+            return 0
+
+        if args.filmcraft_cmd in ("context", "version-up", "collect"):
+            fc_path = Path(args.fcproj)
+            ctx = ws.resolve_working_file_context(fc_path)
+            if args.filmcraft_cmd == "context":
+                if ctx is None:
+                    out = {"found": False, "fcproj": str(fc_path)}
+                else:
+                    out = {
+                        "found": True,
+                        "project_name": ctx.project_name,
+                        "project_root": str(ctx.project_root),
+                        "component_path": ctx.component_path,
+                        "working_version": ctx.working_version,
+                        "working_label": f"v{ctx.working_version:03d}",
+                        "deliverables": sorted(ctx.snapshot.published_deliverables.keys()),
+                    }
+                if args.json:
+                    print(json.dumps(out))
+                elif ctx is None:
+                    print(f"Not an Obol working file: {fc_path}")
+                else:
+                    print(f"{ctx.project_name} / {ctx.component_path} / working/v{ctx.working_version:03d}")
+                return 0
+
+            if ctx is None:
+                err = {"ok": False, "error": f"File is not inside an Obol working/vNNN/ folder: {fc_path}"}
+                if args.json:
+                    print(json.dumps(err))
+                    return 1
+                raise SystemExit(f"Error: {err['error']}")
+
+            if args.filmcraft_cmd == "version-up":
+                bundle = ws.version_up_working(
+                    project_root=ctx.project_root,
+                    component_path=ctx.component_path,
+                    comment=args.comment,
+                    source_version=ctx.working_version,
+                )
+                primary_abs = (ctx.project_root / ctx.component_path / bundle.primary_file).resolve()
+                res = {
+                    "ok": True,
+                    "version": bundle.version,
+                    "version_label": bundle.version_label,
+                    "primary_file": str(primary_abs),
+                    "component_path": ctx.component_path,
+                }
+                if args.json:
+                    print(json.dumps(res))
+                else:
+                    print(f"Created {ctx.component_path}/{bundle.folder_rel} -> {primary_abs}")
+                return 0
+
+            collected = ws.collect_external_dependencies(
+                project_root=ctx.project_root,
+                component_path=ctx.component_path,
+                working_version=ctx.working_version,
+            )
+            res = {
+                "ok": True,
+                "collected_count": len(collected),
+                "assets": [a.asset_path for a in collected],
+            }
+            if args.json:
+                print(json.dumps(res))
+            else:
+                print(f"Collected {len(collected)} external media file(s) into repo/.")
+            return 0
+
+        if args.filmcraft_cmd in ("export", "render-still", "interchange"):
+            fc_path = Path(args.fcproj) if getattr(args, "fcproj", "") else None
+            ctx = ws.resolve_working_file_context(fc_path) if fc_path else None
+            if ctx is not None:
+                proot = ctx.project_root
+                comp_path = args.task or ctx.component_path
+                work_ver: Optional[int] = ctx.working_version
+            else:
+                if not args.task:
+                    raise SystemExit("Error: Pass -t/--task or --fcproj inside an Obol working/vNNN/ folder.")
+                _, proot = _resolve_project_root(active_hub, getattr(args, "project", None))
+                comp_path = args.task
+                work_ver = None
+                if fc_path is None and not bridge.is_live_bridge_listening():
+                    snap = load_component_snapshot(proot, comp_path)
+                    if snap.working_versions and snap.working_versions[-1].primary_file:
+                        cand = (proot / comp_path / snap.working_versions[-1].primary_file).resolve()
+                        if cand.is_file():
+                            fc_path = cand
+
+            target_ver = getattr(args, "into_version", None)
+            deliv_path, ver_num, export_dir = ws.prepare_publish_export_folder(
+                project_root=proot,
+                component_path=comp_path,
+                deliverable_name=args.name,
+                target_version=target_ver,
+            )
+            base_name = f"{deliv_path}_v{ver_num:03d}"
+
+            try:
+                if args.filmcraft_cmd == "export":
+                    ext = "mp4"
+                    if args.preset:
+                        matched = [p for p in bridge.list_export_presets(args.preset) if p.get("name") == args.preset]
+                        if matched and matched[0].get("extension"):
+                            ext = str(matched[0]["extension"]).lstrip(".")
+                    else:
+                        ext = {
+                            "h264": "mp4",
+                            "hevc": "mp4",
+                            "prores": "mov",
+                            "dnxhr": "mov",
+                            "apv": "mov",
+                            "mjpeg": "mov",
+                            "mxf-op1a": "mxf",
+                            "mxf-opatom": "mxf",
+                        }.get(args.format.lower(), args.format.lower())
+                    out_file = export_dir / f"{base_name}.{ext}"
+                    bridge.export_media(
+                        out_file,
+                        project_path=fc_path,
+                        preset=args.preset,
+                        fmt="" if args.preset else args.format,
+                        sequence_id=args.sequence,
+                        range_mode=args.range,
+                        start_seconds=args.start,
+                        end_seconds=args.end,
+                        scale=args.scale,
+                        quality=args.quality,
+                        no_audio=args.no_audio,
+                        allow_offline=args.allow_offline,
+                    )
+                elif args.filmcraft_cmd == "render-still":
+                    out_file = export_dir / f"{base_name}_still.png"
+                    bridge.render_still(
+                        out_file,
+                        seconds=args.seconds,
+                        scale=args.scale,
+                        project_path=fc_path,
+                        allow_offline=args.allow_offline,
+                    )
+                else:
+                    out_file = export_dir / f"{base_name}.{args.format}"
+                    bridge.export_interchange(
+                        out_file,
+                        fmt=args.format,
+                        sequence_id=args.sequence,
+                        project_path=fc_path,
+                    )
+
+                bundle = ws.sync_published_folder(
+                    project_root=proot,
+                    component_path=comp_path,
+                    deliverable_name=deliv_path,
+                    version=ver_num,
+                    source_working_version=work_ver,
+                    comment=args.comment,
+                )
+                if bundle is None:
+                    raise RuntimeError("FilmCraft export produced no output files.")
+                if args.tag:
+                    ws.update_published_metadata(
+                        project_root=proot,
+                        component_path=comp_path,
+                        deliverable_name=deliv_path,
+                        version=bundle.version,
+                        tags=list(dict.fromkeys(list(bundle.tags) + list(args.tag))),
+                    )
+                res = {
+                    "ok": True,
+                    "deliverable_path": deliv_path,
+                    "version": bundle.version,
+                    "version_label": bundle.version_label,
+                    "files": [f.rel_path for f in bundle.files],
+                    "source_working_version": bundle.source_working_version,
+                }
+                if args.json:
+                    print(json.dumps(res))
+                else:
+                    print(f"Exported & published {comp_path}/published/{deliv_path}/{bundle.version_label}")
+                return 0
+            except Exception as exc:
+                if export_dir.is_dir() and not any(export_dir.iterdir()):
+                    export_dir.rmdir()
+                if args.json:
+                    print(json.dumps({"ok": False, "error": str(exc)}))
+                    return 1
+                raise SystemExit(f"Error: {exc}")
 
     if args.command == "integrations":
         from obol.plugins.integrations import DCCIntegrationManager

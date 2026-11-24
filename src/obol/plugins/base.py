@@ -115,6 +115,7 @@ def execute_version_up(
     target_version_dir: Path,
     strategy: Optional[VersionUpStrategy] = None,
     seed_file_path: Optional[Path] = None,
+    seed_version_dir: Optional[Path] = None,
 ) -> Path:
     """Executes one of the 4 configurable Version-Up strategies and returns the new primary file path."""
     active_strategy = strategy or ctx.software_profile.version_up_strategy
@@ -127,9 +128,48 @@ def execute_version_up(
     if active_strategy == VersionUpStrategy.FROM_SEED_TEMPLATE or source_version_dir is None or source_primary_file is None:
         if seed_file_path and seed_file_path.is_file():
             ext = seed_file_path.suffix
-            new_primary = target_version_dir / f"{comp_leaf}_{ver_tag}{ext}"
-            shutil.copy2(seed_file_path, new_primary)
-            unlock_file_writable(new_primary)
+            if seed_version_dir and seed_version_dir.is_dir():
+                seed_files = [
+                    p
+                    for p in sorted(seed_version_dir.rglob("*"))
+                    if p.is_file()
+                    and not p.name.startswith(".")
+                    and ".backups" not in p.parts
+                    and not matches_any_pattern(
+                        p.relative_to(seed_version_dir).as_posix(),
+                        p.name,
+                        ctx.software_profile.ignore_patterns,
+                    )
+                ]
+            else:
+                seed_files = []
+
+            if len(seed_files) > 1 and seed_version_dir is not None:
+                resolved_seed_primary = seed_file_path.resolve()
+                for item in sorted(seed_version_dir.rglob("*")):
+                    rel = item.relative_to(seed_version_dir).as_posix()
+                    if item.name.startswith(".") or ".backups" in item.parts:
+                        continue
+                    if matches_any_pattern(rel, item.name, ctx.software_profile.ignore_patterns):
+                        continue
+                    dest_item = target_version_dir / rel
+                    if item.is_dir():
+                        dest_item.mkdir(parents=True, exist_ok=True)
+                    elif item.is_file():
+                        dest_item.parent.mkdir(parents=True, exist_ok=True)
+                        if item.resolve() == resolved_seed_primary:
+                            dest_item = dest_item.parent / f"{comp_leaf}_{ver_tag}{ext}"
+                            new_primary = dest_item
+                        shutil.copy2(item, dest_item)
+                        unlock_file_writable(dest_item)
+                if new_primary is None:
+                    new_primary = target_version_dir / f"{comp_leaf}_{ver_tag}{ext}"
+                    shutil.copy2(seed_file_path, new_primary)
+                    unlock_file_writable(new_primary)
+            else:
+                new_primary = target_version_dir / f"{comp_leaf}_{ver_tag}{ext}"
+                shutil.copy2(seed_file_path, new_primary)
+                unlock_file_writable(new_primary)
         elif source_primary_file and source_primary_file.is_file():
             new_name = replace_version_in_filename(source_primary_file.name, target_version_num, comp_leaf)
             new_primary = target_version_dir / new_name
@@ -221,11 +261,12 @@ class PluginRegistry:
 
     def _register_builtins(self) -> None:
         from obol.plugins.blender import BlenderPlugin
+        from obol.plugins.filmcraft import FilmCraftPlugin
         from obol.plugins.generic import GenericPlugin
         from obol.plugins.reaper import ReaperPlugin
         from obol.plugins.resolve import ResolvePlugin
 
-        for p in (GenericPlugin(), ReaperPlugin(), BlenderPlugin(), ResolvePlugin()):
+        for p in (GenericPlugin(), ReaperPlugin(), BlenderPlugin(), ResolvePlugin(), FilmCraftPlugin()):
             self._plugins[p.name] = p
 
     def register(self, plugin: ObolPlugin) -> None:

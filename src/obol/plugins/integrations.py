@@ -11,6 +11,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 from obol.core.hub import ObolHub
+from obol.plugins.filmcraft_bridge import (
+    DEFAULT_CONTROL_HOST,
+    DEFAULT_CONTROL_PORT,
+    FilmCraftBridgeClient,
+    detect_filmcraft_executable,
+    detect_filmcraft_install_dir,
+)
+from obol.plugins.filmcraft_installer import FilmCraftInstaller
 from obol.plugins.reaper_bridge import (
     ReaperBridgeClient,
     detect_reaper_executable,
@@ -129,19 +137,22 @@ class DCCIntegrationReport:
 class DCCIntegrationManager:
     """Unified manager for inspecting, installing, updating, testing, and removing DCC integrations."""
 
-    SUPPORTED_DCCS = ("reaper", "resolve")
+    SUPPORTED_DCCS = ("reaper", "resolve", "filmcraft")
 
     def __init__(self, hub: ObolHub, allow_resolve_studio_api: bool = True) -> None:
         self.hub = hub
         self.allow_resolve_studio_api = allow_resolve_studio_api
         self.reaper_installer = ReaperInstaller(hub)
         self.resolve_installer = ResolveInstaller(hub)
+        self.filmcraft_installer = FilmCraftInstaller(hub)
 
     def get_report(self, key: str, target_dir: Optional[Path] = None) -> DCCIntegrationReport:
         if key == "reaper":
             return self._build_reaper_report(target_dir=target_dir)
         if key == "resolve":
             return self._build_resolve_report(target_dir=target_dir)
+        if key == "filmcraft":
+            return self._build_filmcraft_report(target_dir=target_dir)
         raise KeyError(f"Unsupported DCC integration key: '{key}'")
 
     def list_reports(
@@ -247,9 +258,9 @@ class DCCIntegrationManager:
 
         usage_steps = [
             "Open REAPER (the Obol Bridge starts automatically if Startup Auto-Bridge is enabled).",
-            "Press <b>?</b> in REAPER to open the Action List and search for <b>Obol</b> (Open, Save and Version Up, Import Asset, Export and Publish, Collect External Media).",
+            "Press <b>?</b> in REAPER to open the Action List and search for <b>Obol</b> (Open, Increment Save, Save and Version Up, Import Asset, Update Session Media, Export and Publish, Collect External Media).",
             "<i>Optional toolbar</i>: In REAPER open <b>Options → Customize menus/toolbars → Import…</b> and select <code>MenuSets/Obol_Toolbar.ReaperMenu</code>.",
-            "Drag audio/MIDI/.rpp files straight from Obol's GUI into REAPER, or click <b>Export from REAPER...</b> on the Published tab.",
+            "Drag audio/MIDI/.rpp files straight from Obol's GUI into REAPER, or click <b>Update REAPER Media / MIDI...</b> / <b>Export from REAPER...</b> in Obol Studio.",
         ]
 
         return DCCIntegrationReport(
@@ -415,6 +426,125 @@ class DCCIntegrationManager:
             },
         )
 
+    def _build_filmcraft_report(self, target_dir: Optional[Path] = None) -> DCCIntegrationReport:
+        st = self.filmcraft_installer.status(install_dir=target_dir, query_live=False)
+        idir = Path(st["install_dir"]) if st["install_dir"] else None
+        detected = bool(st["install_dir_exists"] or st["executable_exists"] or st["cli_exists"])
+        cfg_installed = bool(st["config_installed"])
+        launcher_installed = bool(st["launcher_installed"])
+        installed = cfg_installed and launcher_installed
+        partial_install = cfg_installed or launcher_installed
+        cfg_ok = bool(st["config_in_sync"])
+        needs_update = (partial_install and not installed) or (installed and not cfg_ok)
+        bridge_connected = bool(st["bridge_connected"])
+        bridge_mode = str(st["bridge_mode"])
+        port = int(st.get("control_port") or DEFAULT_CONTROL_PORT)
+        host = str(st.get("control_host") or DEFAULT_CONTROL_HOST)
+
+        if bridge_connected:
+            bridge_detail = f"Live Control Bridge ({host}:{port})"
+        elif st["cli_exists"]:
+            ver_txt = f" ({st['cli_version']})" if st["cli_version"] else ""
+            bridge_detail = f"Headless CLI Ready{ver_txt} — launch FilmCraft from Obol for live --control bridge"
+        else:
+            bridge_detail = "Offline (filmcraft-cli not found)"
+
+        if bridge_connected:
+            overall = "connected"
+        elif installed and needs_update:
+            overall = "needs_update"
+        elif installed:
+            overall = "installed"
+        elif partial_install:
+            overall = "needs_update"
+        elif detected:
+            overall = "not_installed"
+        else:
+            overall = "not_detected"
+
+        checks = [
+            DCCHealthCheck(
+                "FilmCraft Executable",
+                "ok" if st["executable_exists"] else "warn",
+                st["executable"] or "Not found",
+            ),
+            DCCHealthCheck(
+                "FilmCraft CLI Engine",
+                "ok" if st["cli_exists"] else "missing",
+                f"{st['cli_executable']} ({st['cli_version'] or 'detected'})" if st["cli_exists"] else "filmcraft-cli not found",
+            ),
+            DCCHealthCheck(
+                "FilmCraft Data Folder",
+                "ok" if st["data_dir_exists"] else "info",
+                st["data_dir"] or "Will be created on first FilmCraft launch",
+            ),
+            DCCHealthCheck(
+                "Bridge Config & Launcher Sync",
+                "ok" if (installed and cfg_ok) else ("warn" if partial_install else "missing"),
+                st["config_detail"],
+            ),
+            DCCHealthCheck(
+                "Control Server Port",
+                "ok" if bridge_connected else "info",
+                f"{host}:{port} ({'listening' if bridge_connected else 'ready on Launch'})",
+            ),
+            DCCHealthCheck(
+                "Live Bridge / Headless CLI",
+                "ok" if (bridge_connected or st["cli_exists"]) else "missing",
+                bridge_detail,
+            ),
+        ]
+
+        installed_files: list[str] = []
+        if st["config_installed"]:
+            installed_files.append(st["config_path"])
+        if st["launcher_installed"]:
+            installed_files.append(st["launcher_path"])
+
+        quick_links: list[tuple[str, str]] = []
+        if idir and idir.is_dir():
+            quick_links.append(("Open FilmCraft Folder", str(idir)))
+        bdir = Path(st["bridge_dir"])
+        if bdir.is_dir():
+            quick_links.append(("Open Obol Bridge Folder", str(bdir)))
+        if st["data_dir_exists"]:
+            quick_links.append(("Open FilmCraft Data Folder", st["data_dir"]))
+
+        usage_steps = [
+            "Open any <code>.fcproj</code> working file from Obol (or click <b>Launch App</b>) to start FilmCraft with <code>--control</code> live bridge enabled.",
+            "Headless automation via <code>filmcraft-cli</code> works anytime even when FilmCraft is closed (import clips, update versions, render exports, stills & XML/EDL/OTIO).",
+            "Click <b>Export from FilmCraft...</b> on the Published tab (or right-click a working version) to render directly into <code>published/&lt;deliverable&gt;/vNNN/</code>.",
+            "Use <b>Scan &amp;&amp; Collect External .fcproj Media</b> in the Inspector to ingest external media into <code>repo/</code> and rewrite relative paths inside <code>.fcproj</code>.",
+        ]
+
+        return DCCIntegrationReport(
+            key="filmcraft",
+            display_name="FilmCraft",
+            tagline="Dual-mode NLE integration: live --control bridge & headless filmcraft-cli imports, updates, relative path relinking, and exports.",
+            overall_state=overall,
+            detected=detected,
+            installed=installed or partial_install,
+            needs_update=needs_update,
+            bridge_connected=bridge_connected,
+            bridge_mode=bridge_mode,
+            bridge_detail=bridge_detail,
+            target_dir=st["install_dir"],
+            target_dir_label="FilmCraft Install Folder:",
+            executable=st["executable"],
+            executable_exists=bool(st["executable_exists"]),
+            checks=checks,
+            installed_files=installed_files,
+            quick_links=quick_links,
+            usage_steps=usage_steps,
+            extra={
+                "cli_executable": st["cli_executable"],
+                "cli_version": st["cli_version"],
+                "control_host": host,
+                "control_port": port,
+                "launcher_path": st["launcher_path"],
+            },
+        )
+
     def install(
         self,
         key: str,
@@ -439,6 +569,14 @@ class DCCIntegrationManager:
                 allow_studio_api=self.allow_resolve_studio_api,
             )
             return self.get_report("resolve", target_dir=target_dir)
+        if key == "filmcraft":
+            self.filmcraft_installer.install(
+                install_dir=target_dir,
+                configure_executable=bool(opts.get("configure_executable", True)),
+                executable_override=executable,
+                control_port=int(opts.get("control_port") or DEFAULT_CONTROL_PORT),
+            )
+            return self.get_report("filmcraft", target_dir=target_dir)
         raise KeyError(f"Unsupported DCC integration key: '{key}'")
 
     def uninstall(self, key: str, target_dir: Optional[Path] = None) -> DCCIntegrationReport:
@@ -448,6 +586,9 @@ class DCCIntegrationManager:
         if key == "resolve":
             self.resolve_installer.uninstall(scripts_dir=target_dir, allow_studio_api=self.allow_resolve_studio_api)
             return self.get_report("resolve", target_dir=target_dir)
+        if key == "filmcraft":
+            self.filmcraft_installer.uninstall(install_dir=target_dir)
+            return self.get_report("filmcraft", target_dir=target_dir)
         raise KeyError(f"Unsupported DCC integration key: '{key}'")
 
     def install_all_detected(
@@ -489,6 +630,25 @@ class DCCIntegrationManager:
             mode_lbl = "Studio Python API" if st.mode == "studio_api" else "Lua Bridge"
             return True, f"Connected via {mode_lbl} — {st.product_name or 'DaVinci Resolve'} {st.version} (Project: {st.project_name or 'None'})"
 
+        if key == "filmcraft":
+            client = FilmCraftBridgeClient(self.hub)
+            if client.is_live_bridge_listening():
+                try:
+                    insp = client.inspect_project(use_bridge=True)
+                    pname = str(insp.get("name") or "Untitled")
+                    return True, f"Live Control Bridge OK ({client.control_host}:{client.control_port}) — Project: {pname}"
+                except Exception as exc:
+                    return False, f"Control port listening at {client.control_host}:{client.control_port}, but inspect failed: {exc}"
+            cli_exe = client.resolve_cli_executable()
+            if cli_exe and cli_exe.is_file():
+                ver = client.get_cli_version() or "filmcraft-cli"
+                try:
+                    presets = client.list_export_presets()
+                    return True, f"Headless CLI OK — {ver} ({len(presets)} export presets ready; launch via Obol for live --control bridge)"
+                except Exception as exc:
+                    return False, f"Found {cli_exe}, but preset probe failed: {exc}"
+            return False, "FilmCraft CLI (filmcraft-cli) not found. Configure FilmCraft install folder first."
+
         raise KeyError(f"Unsupported DCC integration key: '{key}'")
 
     def stop_bridge(self, key: str) -> tuple[bool, str]:
@@ -497,9 +657,18 @@ class DCCIntegrationManager:
             return True, "Sent stop signal to DaVinci Resolve Lua Bridge."
         if key == "reaper":
             return False, "Toggle REAPER's bridge from inside REAPER via 'Custom: Obol - Toggle Bridge'."
+        if key == "filmcraft":
+            return False, "Close FilmCraft to stop its built-in --control server."
         raise KeyError(f"Unsupported DCC integration key: '{key}'")
 
     def launch_dcc(self, key: str) -> tuple[bool, str]:
+        if key == "filmcraft":
+            client = FilmCraftBridgeClient(self.hub)
+            exe = client.resolve_app_executable()
+            if exe is None or not exe.is_file():
+                return False, "Executable for 'filmcraft' not found. Set or Auto-Detect the executable path first."
+            client.launch_app(with_control=True)
+            return True, f"Launched {exe.name} (--control {client.control_port})"
         prof = self.hub.get_software_profile(key)
         exe_str = prof.executable
         if not exe_str:
@@ -524,6 +693,13 @@ class DCCIntegrationManager:
             exe = detect_resolve_executable()
             return {
                 "target_dir": str(sdir) if sdir else "",
+                "executable": str(exe) if exe else "",
+            }
+        if key == "filmcraft":
+            idir = detect_filmcraft_install_dir(self.hub)
+            exe = detect_filmcraft_executable(install_dir=idir, hub=self.hub)
+            return {
+                "target_dir": str(idir) if idir else "",
                 "executable": str(exe) if exe else "",
             }
         return {"target_dir": "", "executable": ""}
