@@ -5,11 +5,12 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from PySide6.QtCore import QPoint, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QApplication,
     QComboBox,
     QCompleter,
@@ -65,6 +66,7 @@ from obol.plugins.reaper_bridge import ReaperBridgeClient
 from obol.plugins.reaper_installer import ReaperInstaller
 from obol.plugins.resolve_bridge import ResolveBridgeClient
 from obol.plugins.resolve_installer import ResolveInstaller
+from obol.plugins.send_registry import DCCSendContext, DCCSendRegistry, DCCSendResult, ResolvedDCCTarget
 
 
 def _format_timestamp(iso_str: str) -> str:
@@ -120,6 +122,13 @@ class ObolMainWindow(QMainWindow):
         self.filmcraft_bridge = FilmCraftBridgeClient(self.hub)
         self.filmcraft_installer = FilmCraftInstaller(self.hub)
         self.integration_manager = DCCIntegrationManager(self.hub, allow_resolve_studio_api=allow_studio)
+        self.send_registry = DCCSendRegistry(
+            self.hub,
+            reaper_bridge=self.reaper_bridge,
+            resolve_bridge=self.resolve_bridge,
+            filmcraft_bridge=self.filmcraft_bridge,
+            allow_resolve_studio_api=allow_studio,
+        )
 
         self.active_project_name: str = initial_project or self.hub.config.last_active_project
         self.active_project_root: Optional[Path] = None
@@ -128,6 +137,10 @@ class ObolMainWindow(QMainWindow):
         self.selected_repo_asset_path: str = ""
         self.selected_deliverable_path: str = ""
         self._selected_group_prefix: str = ""
+        self._last_dcc_target_key: str = ""
+        self._cached_dcc_targets: Optional[
+            tuple[Optional[ResolvedDCCTarget], list[ResolvedDCCTarget], list[ResolvedDCCTarget]]
+        ] = None
 
         self.setWindowTitle("Obol — Personal Media Production Pipeline")
         self.resize(1240, 760)
@@ -379,6 +392,7 @@ class ObolMainWindow(QMainWindow):
         self.repo_version_list = DropTreeWidget()
         self.repo_version_list.setRootIsDecorated(False)
         self.repo_version_list.setAlternatingRowColors(True)
+        self.repo_version_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.repo_version_list.setHeaderLabels(["Version", "File", "Size", "Note"])
         self.repo_version_list.header().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.repo_version_list.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
@@ -392,6 +406,7 @@ class ObolMainWindow(QMainWindow):
         self.repo_version_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.repo_version_list.customContextMenuRequested.connect(self._ctx_repo_version_list)
         self.repo_version_list.currentItemChanged.connect(self._on_repo_version_selected)
+        self.repo_version_list.itemSelectionChanged.connect(lambda: self._refresh_dcc_target_ui(refresh_bridges=False))
         self.repo_version_list.itemDoubleClicked.connect(self._on_repo_version_double_clicked)
         self.repo_version_list.filesDropped.connect(self._handle_repo_version_drop)
         self.repo_version_list.enable_file_drag_out(self._drag_path_for_repo_item)
@@ -481,6 +496,7 @@ class ObolMainWindow(QMainWindow):
 
         self.published_version_tree = DropTreeWidget()
         self.published_version_tree.setAlternatingRowColors(True)
+        self.published_version_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.published_version_tree.setHeaderLabels(["Version / File", "Types", "Source / Size", "Note"])
         self.published_version_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self.published_version_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -494,6 +510,7 @@ class ObolMainWindow(QMainWindow):
         self.published_version_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.published_version_tree.customContextMenuRequested.connect(self._ctx_published_version_tree)
         self.published_version_tree.currentItemChanged.connect(self._on_published_version_selected)
+        self.published_version_tree.itemSelectionChanged.connect(lambda: self._refresh_dcc_target_ui(refresh_bridges=False))
         self.published_version_tree.itemDoubleClicked.connect(self._on_published_item_double_clicked)
         self.published_version_tree.filesDropped.connect(self._handle_published_version_drop)
         self.published_version_tree.enable_file_drag_out(self._drag_path_for_published_item)
@@ -506,7 +523,48 @@ class ObolMainWindow(QMainWindow):
         self.triad_tabs.addTab(published_tab, "Published (0)")
 
         self.triad_tabs.currentChanged.connect(lambda _idx: self._sync_inspector_to_active_tab())
-        p2_layout.addWidget(self.triad_tabs)
+        p2_layout.addWidget(self.triad_tabs, 1)
+
+        self.dcc_exchange_bar = QFrame()
+        self.dcc_exchange_bar.setObjectName("DccExchangeBar")
+        dcc_bar_layout = QHBoxLayout(self.dcc_exchange_bar)
+        dcc_bar_layout.setContentsMargins(8, 6, 8, 6)
+        dcc_bar_layout.setSpacing(6)
+
+        dcc_lbl = QLabel("DCC")
+        dcc_lbl.setObjectName("SectionHeader")
+        dcc_bar_layout.addWidget(dcc_lbl)
+
+        self.dcc_target_combo = QComboBox()
+        self.dcc_target_combo.setMinimumWidth(185)
+        self.dcc_target_combo.setToolTip("Choose Auto (follow live DCC) or pin a specific DCC target")
+        self.dcc_target_combo.currentIndexChanged.connect(self._on_dcc_target_combo_changed)
+        dcc_bar_layout.addWidget(self.dcc_target_combo, 2)
+
+        self.dcc_mode_combo = QComboBox()
+        self.dcc_mode_combo.setMinimumWidth(145)
+        self.dcc_mode_combo.setToolTip("Choose how media is sent into the selected DCC")
+        self.dcc_mode_combo.currentIndexChanged.connect(self._on_dcc_mode_combo_changed)
+        dcc_bar_layout.addWidget(self.dcc_mode_combo, 2)
+
+        self.dcc_send_btn = QPushButton("→ Send Media")
+        self.dcc_send_btn.setToolTip("Send selected Repo Assets or Published file(s) to the target DCC (Ctrl+D)")
+        self.dcc_send_btn.clicked.connect(self._action_send_selected_to_active_dcc)
+        dcc_bar_layout.addWidget(self.dcc_send_btn, 2)
+
+        self.dcc_export_btn = QPushButton("← Export…")
+        self.dcc_export_btn.setToolTip("Export / render & publish from the selected DCC")
+        self.dcc_export_btn.clicked.connect(self._action_export_from_active_dcc)
+        dcc_bar_layout.addWidget(self.dcc_export_btn, 1)
+
+        self.dcc_refresh_btn = QPushButton("↻")
+        self.dcc_refresh_btn.setObjectName("SubtleToolButton")
+        self.dcc_refresh_btn.setFixedWidth(28)
+        self.dcc_refresh_btn.setToolTip("Refresh live DCC connection status")
+        self.dcc_refresh_btn.clicked.connect(self._action_refresh_dcc_targets)
+        dcc_bar_layout.addWidget(self.dcc_refresh_btn)
+
+        p2_layout.addWidget(self.dcc_exchange_bar)
         main_splitter.addWidget(pane2)
 
         # Pane 3: Context-Aware Inspector & Actions
@@ -782,6 +840,7 @@ class ObolMainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+Shift+S"), self, activated=self._action_reaper_increment_save)
         QShortcut(QKeySequence("Ctrl+I"), self, activated=self._action_context_ingest)
         QShortcut(QKeySequence("Ctrl+P"), self, activated=self._action_publish_deliverable)
+        QShortcut(QKeySequence("Ctrl+D"), self, activated=self._action_send_selected_to_active_dcc)
         QShortcut(QKeySequence("Ctrl+S"), self, activated=self._save_inspector_metadata)
         QShortcut(QKeySequence("F5"), self, activated=self._action_refresh_and_reconcile)
         QShortcut(QKeySequence("Delete"), self, activated=self._action_delete_focused_widget)
@@ -861,6 +920,7 @@ class ObolMainWindow(QMainWindow):
             self.dcc_status_pill.setText("DCC: Setup…")
             self.dcc_status_pill.setObjectName("StatusPillLocal")
         _repolish(self.dcc_status_pill)
+        self._refresh_dcc_target_ui()
 
     def _update_fast_drop_button(self) -> None:
         on = self.hub.config.fast_drop
@@ -1348,6 +1408,7 @@ class ObolMainWindow(QMainWindow):
             self.reaper_export_btn.setVisible(False)
             self.resolve_export_btn.setVisible(False)
             self.filmcraft_export_btn.setVisible(False)
+            self._refresh_dcc_target_ui(refresh_bridges=False)
             return
 
         prof = self.hub.get_software_profile(snap.software)
@@ -1496,6 +1557,8 @@ class ObolMainWindow(QMainWindow):
                     self.delete_selected_btn.setText(f"Delete {dpath} {bundle.version_label}...")
             self.pub_from_working_btn.setEnabled(bool(latest_w))
             self.pub_from_working_btn.setText(f"Publish from v{latest_w:03d}..." if latest_w else "Publish from Working...")
+
+        self._refresh_dcc_target_ui(refresh_bridges=False)
 
     def _update_software_exe_hint(self, sw_key: str) -> None:
         prof = self.hub.get_software_profile(sw_key)
@@ -2153,44 +2216,287 @@ class ObolMainWindow(QMainWindow):
             return self.active_project_root / self.active_component_path / bundle.primary_file
         return None
 
+    # ---------------- Unified Active Target & Smart DCC Send ----------------
+
+    def _choose_dcc_option(self, title: str, prompt: str, labels: list[str]) -> Optional[int]:
+        chosen, ok = QInputDialog.getItem(self, title, prompt, labels, 0, False)
+        if not ok or not chosen or chosen not in labels:
+            return None
+        return labels.index(chosen)
+
+    def _make_dcc_send_context(self) -> DCCSendContext:
+        return DCCSendContext(
+            hub=self.hub,
+            workspace=self.workspace,
+            project_root=self.active_project_root,
+            project_name=self.active_project_name,
+            component_path=self.active_component_path,
+            component_software=(self.active_snapshot.software if self.active_snapshot else ""),
+            choose_option=self._choose_dcc_option,
+        )
+
+    def _send_paths_for_published_item(self, item: QTreeWidgetItem) -> list[Path]:
+        if not self.active_project_root or not self.active_component_path or not self.active_snapshot:
+            return []
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(data, tuple) or len(data) < 3:
+            return []
+        comp_dir = self.active_project_root / self.active_component_path
+        kind, dpath, ver = str(data[0]), str(data[1]), int(data[2])
+        if kind == "file" and len(data) > 3 and data[3]:
+            p = comp_dir / str(data[3])
+            return [p] if p.is_file() else []
+
+        deliv = self.active_snapshot.published_deliverables.get(dpath)
+        versions = self.active_snapshot.published_versions if dpath == "__legacy__" else (deliv.versions if deliv else [])
+        bundle = next((v for v in versions if v.version == ver), None)
+        if not bundle:
+            return []
+
+        paths: list[Path] = []
+        for tf in bundle.files:
+            if tf.rel_path:
+                cand = comp_dir / tf.rel_path
+                if cand.is_file():
+                    paths.append(cand)
+        if not paths and bundle.primary_file:
+            cand = comp_dir / bundle.primary_file
+            if cand.is_file():
+                paths.append(cand)
+        return paths
+
+    @staticmethod
+    def _dedupe_paths(paths: list[Path]) -> list[Path]:
+        seen: set[Path] = set()
+        out: list[Path] = []
+        for p in paths:
+            rp = p.resolve()
+            if rp not in seen and p.is_file():
+                seen.add(rp)
+                out.append(p)
+        return out
+
+    def _selected_sendable_paths(self) -> list[Path]:
+        if not self.active_project_root or not self.active_component_path or not self.active_snapshot:
+            return []
+        tab_idx = self.triad_tabs.currentIndex()
+        collected: list[Path] = []
+        if tab_idx == 1:
+            items = self.repo_version_list.selectedItems()
+            if not items and self.repo_version_list.currentItem() is not None:
+                items = [self.repo_version_list.currentItem()]  # type: ignore[list-item]
+            for it in items:
+                p = self._drag_path_for_repo_item(it)
+                if p is not None:
+                    collected.append(p)
+        elif tab_idx == 2:
+            items = self.published_version_tree.selectedItems()
+            if not items and self.published_version_tree.currentItem() is not None:
+                items = [self.published_version_tree.currentItem()]  # type: ignore[list-item]
+            for it in items:
+                collected.extend(self._send_paths_for_published_item(it))
+        return self._dedupe_paths(collected)
+
+    def _resolve_export_dcc_key(self, active: Optional[ResolvedDCCTarget]) -> str:
+        if active is not None:
+            return active.target.key
+        if self.active_snapshot and self.active_snapshot.software in ("reaper", "resolve", "filmcraft"):
+            return self.active_snapshot.software
+        return ""
+
+    def _refresh_dcc_target_ui(self, refresh_bridges: bool = True) -> None:
+        if not hasattr(self, "dcc_exchange_bar"):
+            return
+        if refresh_bridges or self._cached_dcc_targets is None:
+            self._cached_dcc_targets = self.send_registry.resolve_targets(self._make_dcc_send_context())
+        active, live_targets, offline_targets = self._cached_dcc_targets
+        pinned_key = self.hub.config.pinned_dcc_target.strip()
+
+        # Populate Target DCC dropdown
+        self.dcc_target_combo.blockSignals(True)
+        self.dcc_target_combo.clear()
+        if active is not None and not active.is_pinned and active.status.live:
+            auto_lbl = f"Auto → {active.target.display_name} ● ({active.status.mode_badge})"
+        elif active is not None and not active.is_pinned and active.status.can_send_offline:
+            auto_lbl = f"Auto → {active.target.display_name} ({active.status.mode_badge})"
+        elif live_targets:
+            first_live = live_targets[0]
+            auto_lbl = f"Auto → {first_live.target.display_name} ● ({first_live.status.mode_badge})"
+        else:
+            auto_lbl = "Auto (No Live DCC)"
+        self.dcc_target_combo.addItem(auto_lbl, "")
+
+        for rt in live_targets:
+            self.dcc_target_combo.addItem(
+                f"{rt.target.display_name} ● ({rt.status.mode_badge})",
+                rt.target.key,
+            )
+        for rt in offline_targets:
+            self.dcc_target_combo.addItem(
+                f"{rt.target.display_name} ({rt.status.mode_badge})",
+                rt.target.key,
+            )
+
+        sel_target_idx = 0
+        if pinned_key:
+            found_idx = self.dcc_target_combo.findData(pinned_key)
+            if found_idx >= 0:
+                sel_target_idx = found_idx
+        self.dcc_target_combo.setCurrentIndex(sel_target_idx)
+        self.dcc_target_combo.blockSignals(False)
+
+        # Populate Mode dropdown for active target
+        prev_mode_id = str(self.dcc_mode_combo.currentData() or "")
+        self.dcc_mode_combo.blockSignals(True)
+        self.dcc_mode_combo.clear()
+        if active is not None:
+            modes = active.target.get_modes()
+            same_target = self._last_dcc_target_key == active.target.key
+            desired_mode_id = (
+                prev_mode_id
+                if (same_target and any(m.id == prev_mode_id for m in modes))
+                else active.default_mode.id
+            )
+            self._last_dcc_target_key = active.target.key
+            for m in modes:
+                self.dcc_mode_combo.addItem(m.label, m.id)
+            mode_idx = self.dcc_mode_combo.findData(desired_mode_id)
+            if mode_idx >= 0:
+                self.dcc_mode_combo.setCurrentIndex(mode_idx)
+            self.dcc_mode_combo.setEnabled(True)
+        else:
+            self._last_dcc_target_key = ""
+            self.dcc_mode_combo.addItem("— No active DCC —", "")
+            self.dcc_mode_combo.setEnabled(False)
+        self.dcc_mode_combo.blockSignals(False)
+
+        # Update Send button
+        paths = self._selected_sendable_paths()
+        has_files = bool(paths)
+        can_send = bool(self.active_snapshot is not None and has_files and active is not None)
+        self.dcc_send_btn.setEnabled(can_send)
+
+        if active is not None:
+            modes = active.target.get_modes()
+            sel_mode_id = str(self.dcc_mode_combo.currentData() or "")
+            sel_mode = next((m for m in modes if m.id == sel_mode_id), active.default_mode)
+            count_txt = f" {len(paths)} Files" if len(paths) > 1 else ""
+            if sel_mode.is_update_action:
+                self.dcc_send_btn.setText(f"↻ Update in {active.target.display_name}")
+            else:
+                self.dcc_send_btn.setText(f"→ Send{count_txt} to {active.target.display_name}")
+            desired_obj = "PrimaryButton" if can_send else ""
+            if self.dcc_send_btn.objectName() != desired_obj:
+                self.dcc_send_btn.setObjectName(desired_obj)
+                _repolish(self.dcc_send_btn)
+            if has_files:
+                self.dcc_send_btn.setToolTip(
+                    f"Send selected media to {active.target.full_name} using '{sel_mode.label}' (Ctrl+D)"
+                )
+            else:
+                self.dcc_send_btn.setToolTip(
+                    f"Select file(s) in Repo Assets or Published tab to send to {active.target.full_name} (Ctrl+D)"
+                )
+        else:
+            self.dcc_send_btn.setText("→ Send Media")
+            if self.dcc_send_btn.objectName():
+                self.dcc_send_btn.setObjectName("")
+                _repolish(self.dcc_send_btn)
+            self.dcc_send_btn.setToolTip(
+                "Open a live DCC or pick a DCC in the dropdown to send Repo/Published media (Ctrl+D)"
+            )
+
+        # Update Export button
+        export_key = self._resolve_export_dcc_key(active)
+        self.dcc_export_btn.setEnabled(self.active_snapshot is not None)
+        if export_key:
+            label_map = {"reaper": "REAPER", "resolve": "Resolve", "filmcraft": "FilmCraft"}
+            exp_label = label_map.get(export_key) or (active.target.display_name if active else export_key.title())
+            self.dcc_export_btn.setText(f"← Export ({exp_label})…")
+            self.dcc_export_btn.setToolTip(f"Export / render & publish directly from {exp_label}")
+        else:
+            self.dcc_export_btn.setText("← Export / Publish…")
+            self.dcc_export_btn.setToolTip("Publish deliverables into the active component")
+
+    def _set_pinned_dcc_target(self, target_key: str, refresh_bridges: bool = True) -> None:
+        self.hub.set_pinned_dcc_target(target_key)
+        self._refresh_dcc_target_ui(refresh_bridges=refresh_bridges)
+        if not target_key:
+            self.show_status_message("✓ Active target DCC: Auto (Follow Live)")
+        else:
+            target = self.send_registry.get(target_key)
+            name = target.display_name if target else target_key
+            self.show_status_message(f"✓ Pinned target DCC: {name}")
+
+    def _on_dcc_target_combo_changed(self, _idx: int) -> None:
+        key = str(self.dcc_target_combo.currentData() or "")
+        self._set_pinned_dcc_target(key, refresh_bridges=True)
+
+    def _on_dcc_mode_combo_changed(self, _idx: int) -> None:
+        mode_id = str(self.dcc_mode_combo.currentData() or "")
+        if self._cached_dcc_targets is not None and mode_id:
+            active = self._cached_dcc_targets[0]
+            if active is not None:
+                chosen = next((m for m in active.target.get_modes() if m.id == mode_id), None)
+                if chosen is not None and chosen.remember_as_default:
+                    self.hub.set_preferred_dcc_mode(active.target.key, chosen.id)
+                    active.default_mode = chosen
+        self._refresh_dcc_target_ui(refresh_bridges=False)
+
+    def _dispatch_send_to_dcc(
+        self,
+        target_key: str,
+        paths: list[Path],
+        mode_id: Optional[str] = None,
+        silent: bool = False,
+    ) -> DCCSendResult:
+        res = self.send_registry.send(target_key, paths, mode_id, self._make_dcc_send_context())
+        self._refresh_dcc_target_ui(refresh_bridges=True)
+        if res.ok:
+            self.show_status_message(f"✓ {res.message}")
+        elif not res.details.get("cancelled") and not silent:
+            target = self.send_registry.get(target_key)
+            title = f"Send to {target.display_name}" if target else "Send to DCC"
+            if res.offline_hint:
+                QMessageBox.information(self, title, res.message)
+            else:
+                QMessageBox.warning(self, title, res.message)
+        return res
+
+    def _action_send_selected_to_active_dcc(self) -> None:
+        paths = self._selected_sendable_paths()
+        if not paths:
+            return
+        if self._cached_dcc_targets is None:
+            self._cached_dcc_targets = self.send_registry.resolve_targets(self._make_dcc_send_context())
+        active = self._cached_dcc_targets[0]
+        if active is None:
+            self.show_status_message("No active DCC target — select a DCC in the DCC bar first")
+            return
+        mode_id = str(self.dcc_mode_combo.currentData() or active.default_mode.id)
+        self._dispatch_send_to_dcc(active.target.key, paths, mode_id=mode_id)
+
+    def _action_export_from_active_dcc(self) -> None:
+        if not self.active_project_root or not self.active_component_path:
+            return
+        if self._cached_dcc_targets is None:
+            self._cached_dcc_targets = self.send_registry.resolve_targets(self._make_dcc_send_context())
+        export_key = self._resolve_export_dcc_key(self._cached_dcc_targets[0])
+        if export_key == "reaper":
+            self._action_export_from_reaper()
+        elif export_key == "resolve":
+            self._action_export_from_resolve()
+        elif export_key == "filmcraft":
+            self._action_export_from_filmcraft()
+        else:
+            self._action_publish_deliverable()
+
+    def _action_refresh_dcc_targets(self) -> None:
+        self._refresh_reaper_status_pill()
+        self.show_status_message("✓ Refreshed DCC status")
+
     def _action_import_files_into_reaper(self, paths: list[Path], mode: str = "new_track") -> None:
-        existing = [p for p in paths if p.is_file()]
-        if not existing:
-            QMessageBox.warning(self, "Import into REAPER", "Target file(s) are not available locally on disk.")
-            return
-        if not self.reaper_bridge.is_connected():
-            QMessageBox.information(
-                self,
-                "REAPER Bridge Offline",
-                "REAPER Bridge is not currently running.\n\n"
-                "Open REAPER (with Obol Bridge installed via ⚙ Settings → REAPER Integration...), "
-                "or drag the file directly from this list into REAPER's Arrange view.",
-            )
-            return
-        metas: list[dict[str, Any]] = []
-        for p in existing:
-            meta = (
-                self.workspace.describe_asset_file(self.active_project_root, p)
-                if self.active_project_root
-                else None
-            )
-            if meta is None:
-                meta = {
-                    "file_path": str(p.resolve()),
-                    "file_name": p.name,
-                    "media_kind": "midi" if p.suffix.lower() in (".mid", ".midi") else "media",
-                }
-            metas.append(meta)
-        try:
-            res = self.reaper_bridge.insert_media(
-                existing,
-                mode=mode,
-                asset_meta=(metas[0] if len(metas) == 1 else {}),
-                asset_metas=metas,
-            )
-            self.show_status_message(f"✓ Imported {res.get('inserted', len(existing))} file(s) into REAPER")
-        except Exception as exc:
-            QMessageBox.warning(self, "Import into REAPER", str(exc))
+        self._dispatch_send_to_dcc("reaper", paths, mode_id=mode)
 
     def _action_open_reaper_update_dialog(self) -> None:
         active_rpp = self.reaper_bridge.get_state().active_rpp
@@ -2221,6 +2527,11 @@ class ObolMainWindow(QMainWindow):
         update_mode: str = "replace_source",
         silent: bool = False,
     ) -> dict[str, Any]:
+        if update_mode == "replace_source":
+            res = self._dispatch_send_to_dcc("reaper", [target_path], mode_id="update_existing", silent=silent)
+            if res.details:
+                return dict(res.details)
+            return {"updated_takes": res.sent_count, "updated_items": 0}
         if not target_path.is_file() or not self.active_project_root:
             if not silent:
                 QMessageBox.warning(self, "Update in REAPER", "Target file is not available locally on disk.")
@@ -2306,29 +2617,8 @@ class ObolMainWindow(QMainWindow):
             self.show_status_message("✓ Exported & published from REAPER")
 
     def _action_load_files_into_resolve(self, paths: list[Path], append_to_timeline: bool = False) -> None:
-        existing = [p for p in paths if p.is_file()]
-        if not existing:
-            QMessageBox.warning(self, "Load into Resolve", "Target file(s) are not available locally on disk.")
-            return
-        if not self.resolve_bridge.is_connected():
-            QMessageBox.information(
-                self,
-                "DaVinci Resolve Offline",
-                "DaVinci Resolve is not currently connected.\n\n"
-                "Inside Resolve, run Workspace → Scripts → Utility → Obol - Load Media into Media Pool "
-                "(or start Obol - Live Bridge in Resolve for direct GUI push).",
-            )
-            return
-        try:
-            bin_path = f"Obol/{self.active_component_path}" if self.active_component_path else ""
-            res = self.resolve_bridge.import_media(
-                existing,
-                bin_path=bin_path,
-                append_to_timeline=append_to_timeline,
-            )
-            self.show_status_message(f"✓ Loaded {res.get('imported', len(existing))} clip(s) into Resolve Media Pool")
-        except Exception as exc:
-            QMessageBox.warning(self, "Load into Resolve", str(exc))
+        mode = "timeline" if append_to_timeline else "media_pool"
+        self._dispatch_send_to_dcc("resolve", paths, mode_id=mode)
 
     def _action_export_from_resolve(self) -> None:
         if not self.active_project_root or not self.active_component_path:
@@ -2389,56 +2679,8 @@ class ObolMainWindow(QMainWindow):
         paths: list[Path],
         place_on_timeline: bool = False,
     ) -> None:
-        existing = [p for p in paths if p.is_file()]
-        if not existing:
-            QMessageBox.warning(self, "Import into FilmCraft", "Target file(s) are not available locally on disk.")
-            return
-        live = self.filmcraft_bridge.is_live_bridge_listening()
-        fcproj = None if live else self._active_working_fcproj()
-        if not live and fcproj is None:
-            candidates = self._list_project_filmcraft_files()
-            if len(candidates) == 1:
-                fcproj = candidates[0][1]
-            elif len(candidates) > 1:
-                labels = [f"{comp} ({p.name})" for comp, p in candidates]
-                chosen, ok = QInputDialog.getItem(
-                    self,
-                    "Select Target FilmCraft Project",
-                    "FilmCraft live bridge is offline. Select which component's .fcproj to import into:",
-                    labels,
-                    0,
-                    False,
-                )
-                if not ok or not chosen:
-                    return
-                fcproj = candidates[labels.index(chosen)][1]
-        if not live and fcproj is None:
-            QMessageBox.information(
-                self,
-                "FilmCraft Target Needed",
-                "No live FilmCraft --control session or FilmCraft working .fcproj was found in this project.\n\n"
-                "Open a FilmCraft working version from Obol or create a FilmCraft component first.",
-            )
-            return
-        try:
-            bin_path = f"Obol/{self.active_component_path}" if self.active_component_path else ""
-            res = self.filmcraft_bridge.import_media(
-                existing,
-                bin_path=bin_path,
-                place_on_timeline=place_on_timeline,
-                project_path=fcproj,
-                use_bridge=live,
-            )
-            count = res.get("imported", len(existing))
-            if live:
-                self.show_status_message(f"✓ Imported {count} file(s) into live FilmCraft")
-            else:
-                assert fcproj is not None
-                self.show_status_message(
-                    f"✓ Imported {count} file(s) into {fcproj.name} (headless — reopen in FilmCraft or open via Obol for live bridge)"
-                )
-        except Exception as exc:
-            QMessageBox.warning(self, "Import into FilmCraft", str(exc))
+        mode = "timeline" if place_on_timeline else "project_bin"
+        self._dispatch_send_to_dcc("filmcraft", paths, mode_id=mode)
 
     def _action_import_dialog_filmcraft(self, version: Optional[int] = None) -> None:
         if not self.active_project_root or not self.active_component_path:
@@ -2869,41 +3111,18 @@ class ObolMainWindow(QMainWindow):
         if item is None:
             return
         ver = int(item.data(0, Qt.ItemDataRole.UserRole))
-        target_path = self._drag_path_for_repo_item(item)
         menu = QMenu(self)
         act_open = menu.addAction(f"Open v{ver:03d} File")
-        act_reap_new = menu.addAction("Import into REAPER (New Track)")
-        act_reap_cur = menu.addAction("Import into REAPER (At Cursor)")
-        act_reap_take = menu.addAction("Import into REAPER (New Take)")
-        act_reap_upd = menu.addAction("Update Existing in REAPER Session")
-        act_dvr_pool = menu.addAction("Load into Resolve Media Pool")
-        act_dvr_tl = menu.addAction("Load into Resolve + Timeline")
-        act_fc_bin = menu.addAction("Import into FilmCraft (Project Bin)")
-        act_fc_tl = menu.addAction("Import into FilmCraft (+ Timeline)")
         act_new_v = menu.addAction("+ Ingest New Version...")
         act_exp = menu.addAction("Open Version Folder in Explorer")
         act_copy = menu.addAction("Copy File Path")
         menu.addSeparator()
         act_del = menu.addAction(f"Delete Repo v{ver:03d}...")
         chosen = menu.exec(self.repo_version_list.viewport().mapToGlobal(pos))
+        if chosen is None:
+            return
         if chosen == act_open:
             self._on_repo_version_double_clicked(item, 0)
-        elif chosen == act_reap_new and target_path:
-            self._action_import_files_into_reaper([target_path], mode="new_track")
-        elif chosen == act_reap_cur and target_path:
-            self._action_import_files_into_reaper([target_path], mode="cursor_track")
-        elif chosen == act_reap_take and target_path:
-            self._action_import_files_into_reaper([target_path], mode="new_take")
-        elif chosen == act_reap_upd and target_path:
-            self._action_update_asset_in_reaper(target_path)
-        elif chosen == act_dvr_pool and target_path:
-            self._action_load_files_into_resolve([target_path], append_to_timeline=False)
-        elif chosen == act_dvr_tl and target_path:
-            self._action_load_files_into_resolve([target_path], append_to_timeline=True)
-        elif chosen == act_fc_bin and target_path:
-            self._action_import_files_into_filmcraft([target_path], place_on_timeline=False)
-        elif chosen == act_fc_tl and target_path:
-            self._action_import_files_into_filmcraft([target_path], place_on_timeline=True)
         elif chosen == act_new_v:
             self._action_ingest_repo_version()
         elif chosen == act_exp:
@@ -2935,41 +3154,18 @@ class ObolMainWindow(QMainWindow):
         if item is None:
             return
         data = item.data(0, Qt.ItemDataRole.UserRole)
-        target_path = self._drag_path_for_published_item(item)
         menu = QMenu(self)
         act_open = menu.addAction("Open File") if (isinstance(data, tuple) and data[0] == "file") else None
-        act_reap_new = menu.addAction("Import into REAPER (New Track)") if target_path else None
-        act_reap_cur = menu.addAction("Import into REAPER (At Cursor)") if target_path else None
-        act_reap_take = menu.addAction("Import into REAPER (New Take)") if target_path else None
-        act_reap_upd = menu.addAction("Update Existing in REAPER Session") if target_path else None
-        act_dvr_pool = menu.addAction("Load into Resolve Media Pool") if target_path else None
-        act_dvr_tl = menu.addAction("Load into Resolve + Timeline") if target_path else None
-        act_fc_bin = menu.addAction("Import into FilmCraft (Project Bin)") if target_path else None
-        act_fc_tl = menu.addAction("Import into FilmCraft (+ Timeline)") if target_path else None
         act_add = menu.addAction("+ Attach More Files to Release...")
         act_exp = menu.addAction("Open Release Folder in Explorer")
         act_copy = menu.addAction("Copy Path")
         menu.addSeparator()
         act_del = menu.addAction("Delete Published Release...")
         chosen = menu.exec(self.published_version_tree.viewport().mapToGlobal(pos))
-        if chosen is not None and chosen == act_open:
+        if chosen is None:
+            return
+        if act_open is not None and chosen == act_open:
             self._on_published_item_double_clicked(item, 0)
-        elif act_reap_new is not None and chosen == act_reap_new and target_path:
-            self._action_import_files_into_reaper([target_path], mode="new_track")
-        elif act_reap_cur is not None and chosen == act_reap_cur and target_path:
-            self._action_import_files_into_reaper([target_path], mode="cursor_track")
-        elif act_reap_take is not None and chosen == act_reap_take and target_path:
-            self._action_import_files_into_reaper([target_path], mode="new_take")
-        elif act_reap_upd is not None and chosen == act_reap_upd and target_path:
-            self._action_update_asset_in_reaper(target_path)
-        elif act_dvr_pool is not None and chosen == act_dvr_pool and target_path:
-            self._action_load_files_into_resolve([target_path], append_to_timeline=False)
-        elif act_dvr_tl is not None and chosen == act_dvr_tl and target_path:
-            self._action_load_files_into_resolve([target_path], append_to_timeline=True)
-        elif act_fc_bin is not None and chosen == act_fc_bin and target_path:
-            self._action_import_files_into_filmcraft([target_path], place_on_timeline=False)
-        elif act_fc_tl is not None and chosen == act_fc_tl and target_path:
-            self._action_import_files_into_filmcraft([target_path], place_on_timeline=True)
         elif chosen == act_add and isinstance(data, tuple) and len(data) >= 3 and data[1] != "__legacy__":
             self._publish_flow([], default_deliverable=str(data[1]), default_target_version=int(data[2]))
         elif chosen == act_exp:

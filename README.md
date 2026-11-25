@@ -17,8 +17,9 @@
 
 ### 3-Pane PySide6 Desktop GUI (`obol gui`)
 - Studio dark Fusion theme with custom SVG branch chevrons and packaged app icon (`src/obol/gui/assets/obol_icon.{ico,png}`).
-- Zero-project welcome screen, searchable hierarchical component tree, and tabbed Triad workspace (`Working`, `Repo Assets`, `Published`) featuring OS drag-and-drop/drag-out, tab-bar hover switching, and a `Fast Drop` toggle.
-- Context-aware Inspector & Actions pane, keyboard shortcuts (`Ctrl+N`, `Ctrl+Shift+N`, `Ctrl+U`, `Ctrl+I`, `Ctrl+P`, `Ctrl+S`, `Ctrl+Shift+S`, `F5`, `Delete`), and safe read-only-aware deletion across versions, named assets/deliverables, components, and projects.
+- Zero-project welcome screen, searchable hierarchical component tree, and tabbed Triad workspace (`Working`, `Repo Assets`, `Published`) featuring OS drag-and-drop/drag-out, multi-selection on `Repo Assets` / `Published`, tab-bar hover switching, and a `Fast Drop` toggle.
+- Dedicated **DCC Exchange Bar** docked below the Triad tabs with an Auto/Pinned Target DCC selector, per-DCC Send Mode selector (remembered per DCC), 1-click `→ Send` / `↻ Update` (`Ctrl+D`), `← Export (<DCC>)…`, and `↻` live status refresh, keeping right-click menus focused and instant.
+- Context-aware Inspector & Actions pane, keyboard shortcuts (`Ctrl+N`, `Ctrl+Shift+N`, `Ctrl+U`, `Ctrl+I`, `Ctrl+P`, `Ctrl+D`, `Ctrl+S`, `Ctrl+Shift+S`, `F5`, `Delete`), and safe read-only-aware deletion across versions, named assets/deliverables, components, and projects.
 - Built-in dialogs for New Project Wizard (with live folder/seed preview), 3-Tier Template & Scoped Seed Manager, Software Profiles, Projects & Vault Manager, Credits Report (Markdown copy & CSV export), and the Unified DCC Integrations Manager.
 
 ### 3-Tier Composable Template Engine
@@ -33,7 +34,7 @@
 - **DaVinci Resolve (Free & Studio)**: 1-click Lua menu script installer (`Utility/` and `Deliver/`), Media Pool import & clip version updating (`ReplaceClipPreserveSubClip`), Render Queue / Quick Export / Deliver staging / Still / `.drp` publishing, Studio Python API + optional Free live IPC bridge, and remembered Resolve-project-to-Obol-component bindings.
 - **FilmCraft NLE**: Dual-mode `.fcproj` JSON plugin + `filmcraft-cli` headless & token-authenticated `--control` live bridge integration, relative path external media scanning & 1-click collector/relinker into `repo/`, project media version updater (`media.replaceFootage`), preset/format sequence exports, still renders, and XML/FCPXML/EDL/OTIO/AAF/OMF interchange publishing.
 - **Blender 3D**: `.blend` plugin with automatic `.blend1`/`.blend2` backup tidying into `.backups/`.
-- **Unified DCC Integrations Manager**: Centralized health and config-drift diagnostics, 1-click install/update/uninstall, and connection testing via the GUI or `obol integrations`.
+- **Unified DCC Send Registry & Integrations Manager**: Extensible `DCCSendRegistry` (`src/obol/plugins/send_registry.py`) backing the GUI's DCC Exchange Bar (supporting built-in REAPER, Resolve, and FilmCraft adapters plus custom user plugin `get_send_target(hub)` hooks), alongside centralized health/config-drift diagnostics, 1-click install/update/uninstall, and connection testing via the GUI or `obol integrations`.
 
 ### Command-Line Interface (`obol`)
 Pure-Python `argparse` CLI covering `root`, `init`, `project`, `task`, `work`, `ingest`, `publish`, `credits`, `template`, `seed`, `software`, `vault`, `push`, `archive`, `checkout`, `delete`, `reaper`, `resolve`, `filmcraft`, `integrations`, and `gui`.
@@ -66,7 +67,7 @@ $env:PYTHONPATH="src"; python -m obol.cli.main gui
 # Run CLI commands
 $env:PYTHONPATH="src"; python -m obol.cli.main --help
 
-# Run the automated unit test suite (55 tests across 14 modules; GUI tests run headless via QT_QPA_PLATFORM=offscreen)
+# Run the automated unit test suite (59 tests across 15 modules; GUI tests run headless via QT_QPA_PLATFORM=offscreen)
 $env:PYTHONPATH="src"; python -m unittest discover -s tests -v
 ```
 

@@ -54,6 +54,7 @@ d:\tu_tools\obol\
 │       │   ├── storage.py                # Atomic TOML I/O, CRC32 events.jsonl, compaction & Reconciler
 │       │   ├── index.py                  # Disposable local SQLite cache (.obol/index.db)
 │       │   ├── templates.py              # 3-Tier TemplateManager (Project, Task, Seed File)
+│       │   ├── seed_templates.py         # Scoped & versioned software seed templates (Project -> Root -> Global)
 │       │   ├── hub.py                    # Global ObolHub (~/.obol/ config, client root, projects, vault)
 │       │   ├── sync.py                   # Stateless Server-Client SyncEngine (pull_paths / push_paths)
 │       │   └── workspace.py              # High-level ObolWorkspace pipeline operations facade
@@ -68,7 +69,11 @@ d:\tu_tools\obol\
 │       │   ├── resolve_bridge.py         # Dual-mode Resolve client (Studio Python API + Atomic JSON IPC)
 │       │   ├── resolve_scripts.py        # Pure-Lua Resolve menu & live bridge script generators
 │       │   ├── resolve_installer.py      # 1-click DaVinci Resolve script installer/uninstaller
+│       │   ├── filmcraft.py              # FilmCraft NLE (.fcproj) JSON plugin & external media collector
+│       │   ├── filmcraft_bridge.py       # Dual-mode FilmCraft client (TCP --control bridge + headless CLI)
+│       │   ├── filmcraft_installer.py    # FilmCraft bridge config & --control launcher installer
 │       │   ├── integrations.py           # Unified DCCIntegrationManager & config-drift diagnostics
+│       │   ├── send_registry.py          # Unified DCCSendRegistry, target ranking & built-in send adapters
 │       │   └── blender.py                # Blender 3D (.blend) plugin
 │       ├── cli/
 │       │   └── main.py                   # Pure-Python argparse CLI (`obol ...`)
@@ -79,7 +84,8 @@ d:\tu_tools\obol\
 │           ├── integrations_dialog.py    # Unified Master-Detail DCC Integrations Manager dialog
 │           ├── reaper_dialogs.py         # Focused REAPER companion dialogs (Open, Import/Update, Export, Setup)
 │           ├── resolve_dialogs.py        # Focused DaVinci Resolve dialogs (Media Pool Load/Update, Export, Setup)
-│           └── app.py                    # Main 3-Pane ObolMainWindow
+│           ├── filmcraft_dialogs.py      # Focused FilmCraft dialogs (Import/Update, Export/Publish, Setup)
+│           └── app.py                    # Main 3-Pane ObolMainWindow + DCC Exchange Bar
 └── tests/                                # Automated unittest / pytest suite
     ├── test_storage_resilience.py        # Fault isolation, compaction, reconciler & SQLite rebuild
     ├── test_hierarchy_and_repo.py        # Mixed-depth components, versioned repo & provenance credits
@@ -87,8 +93,11 @@ d:\tu_tools\obol\
     ├── test_reaper_plugin.py             # .rpp path patching & external media collection into repo/
     ├── test_reaper_integration.py        # REAPER IPC bridge, Lua installer, CLI, dialogs & drag-out
     ├── test_resolve_integration.py       # DaVinci Resolve dual-mode bridge, Lua installer, CLI & dialogs
+    ├── test_filmcraft_integration.py     # FilmCraft dual-mode bridge, headless CLI, dialogs & relinking
     ├── test_integrations_manager.py      # Unified DCC integration manager, drift detection & UI smoke
+    ├── test_dcc_send_registry.py         # Unified DCCSendRegistry, target ranking & DCC Exchange Bar UI
     ├── test_templates.py                 # 3-tier template preview, CRUD & capture
+    ├── test_seed_templates.py            # Scoped & versioned seed template cascade, pinning & CLI/GUI
     ├── test_server_client_sync.py        # Client root persistence, vault archival & selective checkout
     ├── test_ingest_and_multipublish.py   # Working ingest, named multi-file deliverables, export sync & CLI
     ├── test_delete_operations.py         # Safe deletion of versions, named assets/deliverables, components & projects
@@ -104,7 +113,7 @@ Always run the full test suite after making any changes:
 ```powershell
 $env:PYTHONPATH="src"; python -m unittest discover -s tests -v
 ```
-All GUI tests in `tests/test_gui_smoke.py` set `QT_QPA_PLATFORM=offscreen` automatically so they run headlessly in CI/terminal environments without popping up blocking windows.
+All headless GUI tests (including `tests/test_gui_smoke.py` and `tests/test_dcc_send_registry.py`) set `QT_QPA_PLATFORM=offscreen` automatically so they run headlessly in CI/terminal environments without popping up blocking windows.
 
 ### Launch the Desktop GUI
 ```powershell

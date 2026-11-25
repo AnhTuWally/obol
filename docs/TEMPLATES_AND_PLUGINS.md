@@ -135,6 +135,7 @@ class ObolPlugin(Protocol):
 ### Where to Place New Plugins
 - **Built-in plugins**: Add to `src/obol/plugins/<name>.py` and register in `PluginRegistry._register_builtins()` (`src/obol/plugins/base.py`).
 - **User dynamic plugins**: Drop any `.py` file into `~/.obol/plugins/<name>.py` defining either a `register_plugin() -> ObolPlugin` function or a `Plugin` class. `PluginRegistry.load_user_plugins()` loads it automatically at startup.
+- **Registering as a Send Media destination**: Expose an optional `get_send_target(self, hub) -> DCCSendTarget` method (or `send_target` attribute) returning an object implementing `DCCSendTarget` (`src/obol/plugins/send_registry.py`). `DCCSendRegistry` automatically discovers it and surfaces it in the **DCC Exchange Bar** (`Target`, `Mode`, `→ Send`, `Ctrl+D`).
 
 ---
 
@@ -176,7 +177,7 @@ Obol pairs offline `.rpp` intelligence with a **zero-dependency Lua ReaScript + 
   - From CLI: run `obol reaper increment-save [--rpp <path>] [-m <note>]` (or `prepare-working` + `register-working`).
 - **Updating Imported MIDI & Media**:
   - From REAPER: run **Custom: Obol - Update Session Media** (or `Obol: Update` toolbar button).
-  - From Obol GUI: click **Update REAPER Media / MIDI...** in the Inspector, or right-click any `repo/` or `published/` version and choose **Update Existing in REAPER Session**.
+  - From Obol GUI: click **Update REAPER Media / MIDI...** in the Inspector, or select the item(s) in `Repo Assets` / `Published`, choose **REAPER** and **Update Existing in Session** in the **DCC Exchange Bar**, and click **↻ Update in REAPER** (`Ctrl+D`).
   - From CLI: run `obol reaper update-media [--rpp <path>] [--check] [--offline] [--mode replace_source|add_take] [--midi-mode preserve|in_project|file_ref]`.
 
 ---
@@ -204,3 +205,21 @@ Obol integrates with **FilmCraft** (`.fcproj`) in dual mode — working both **h
 - **Dual-Mode Bridge (`FilmCraftBridgeClient`) & Installer (`FilmCraftInstaller`)**:
   - Auto-detects `filmcraft.exe`, `filmcraft-cli.exe`, and `%APPDATA%\FilmCraft`, writes `~/.obol/bridge/filmcraft/config.json` + a `--control` launcher script, and launches FilmCraft with `--control 47420` when opening `.fcproj` files from Obol.
   - Supports bin creation (`file.newBin`), media import (`file.import` / `edit.pasteMedia`), footage version upgrades (`media.replaceFootage`), preset/format media exports (`export` / `file.exportMedia`), still frame renders (`render`), and XML/FCPXML/EDL/OTIO/AAF/OMF interchange exports (`file.exportInterchange`) directly into `published/<deliverable>/vNNN/`.
+
+---
+
+## 8. Unified DCC Send Registry (`src/obol/plugins/send_registry.py`)
+
+`DCCSendRegistry` provides a Qt-free abstraction for resolving active DCC destinations, remembering per-DCC send modes, and dispatching media from the GUI's **DCC Exchange Bar** without hardcoding per-app branches in `app.py`:
+
+- **Protocol & Mode Descriptors (`DCCSendTarget`, `DCCSendMode`)**:
+  - Each target declares `key`, `display_name`, `full_name`, `default_mode_id`, `get_modes()`, `get_status(ctx)`, and `send_files(paths, mode_id, ctx)`.
+  - `DCCSendMode` distinguishes normal insert modes (`remember_as_default=True`, persisted per DCC in `GlobalConfig.dcc_default_modes`) from maintenance actions like REAPER's `update_existing` (`is_update_action=True`, `remember_as_default=False`) and offline/headless-capable modes (`requires_live=False`).
+- **Built-in Adapters**:
+  - `ReaperSendTarget` (`new_track`, `cursor_track`, `new_take`, `update_existing`) via `ReaperBridgeClient`.
+  - `ResolveSendTarget` (`media_pool`, `timeline`) via `ResolveBridgeClient`.
+  - `FilmCraftSendTarget` (`project_bin`, `timeline`) via `FilmCraftBridgeClient` (live `--control` bridge or headless `.fcproj` fallback when working `.fcproj` files exist in the active project).
+- **Auto-Live & Pinned Resolution (`resolve_targets`)**:
+  - If `GlobalConfig.pinned_dcc_target` is set, that DCC is always selected as the active target; otherwise Auto mode ranks live DCCs first (breaking ties by `last_used_dcc_target`, then the component's bound software), falling back to headless-capable targets when no live DCC is running.
+- **Custom Plugin Auto-Discovery**:
+  - User plugins in `~/.obol/plugins/` that expose `get_send_target(hub)` or `send_target` are registered automatically at startup and appear in the DCC Exchange Bar alongside built-in DCCs.

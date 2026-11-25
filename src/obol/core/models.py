@@ -206,6 +206,9 @@ class GlobalConfig:
     last_active_project: str = ""
     author_name: str = ""
     fast_drop: bool = False
+    pinned_dcc_target: str = ""
+    last_used_dcc_target: str = ""
+    dcc_default_modes: dict[str, str] = field(default_factory=dict)
     vault: VaultConfig = field(default_factory=VaultConfig)
     software: dict[str, SoftwareProfile] = field(default_factory=default_software_profiles)
 
@@ -215,6 +218,9 @@ class GlobalConfig:
             "last_active_project": self.last_active_project,
             "author_name": self.author_name,
             "fast_drop": self.fast_drop,
+            "pinned_dcc_target": self.pinned_dcc_target,
+            "last_used_dcc_target": self.last_used_dcc_target,
+            "dcc_default_modes": self.dcc_default_modes,
             "vault": self.vault.to_dict(),
             "software": {k: v.to_dict() for k, v in self.software.items()},
         })
@@ -226,11 +232,22 @@ class GlobalConfig:
         for k, v in sw_raw.items():
             if isinstance(v, dict):
                 sw[k] = SoftwareProfile.from_dict(k, v)
+        modes_raw = data.get("dcc_default_modes", {})
+        dcc_default_modes: dict[str, str] = {}
+        if isinstance(modes_raw, dict):
+            for k, v in modes_raw.items():
+                ks = str(k).strip()
+                vs = str(v).strip()
+                if ks and vs:
+                    dcc_default_modes[ks] = vs
         return cls(
             default_workspace_root=str(data.get("default_workspace_root", "")),
             last_active_project=str(data.get("last_active_project", "")),
             author_name=str(data.get("author_name", "")),
             fast_drop=bool(data.get("fast_drop", False)),
+            pinned_dcc_target=str(data.get("pinned_dcc_target", "")),
+            last_used_dcc_target=str(data.get("last_used_dcc_target", "")),
+            dcc_default_modes=dcc_default_modes,
             vault=VaultConfig.from_dict(data.get("vault", {})),
             software=sw,
         )

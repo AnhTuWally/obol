@@ -106,6 +106,45 @@ class ObolHub:
             self.config.last_active_project = project_name
             self.save_config()
 
+    def set_pinned_dcc_target(self, target_key: str) -> None:
+        """Persists the pinned DCC send target key (or '' for Auto follow-live mode)."""
+        cleaned = target_key.strip()
+        if self.config.pinned_dcc_target != cleaned:
+            self.config.pinned_dcc_target = cleaned
+            self.save_config()
+
+    def record_dcc_send(
+        self,
+        target_key: str,
+        mode_id: str = "",
+        remember_mode: bool = True,
+    ) -> None:
+        """Records the last used DCC target and optionally remembers its default send mode."""
+        tkey = target_key.strip()
+        mid = mode_id.strip()
+        changed = False
+        if tkey and self.config.last_used_dcc_target != tkey:
+            self.config.last_used_dcc_target = tkey
+            changed = True
+        if tkey and remember_mode and mid:
+            if self.config.dcc_default_modes.get(tkey) != mid:
+                self.config.dcc_default_modes[tkey] = mid
+                changed = True
+        if changed:
+            self.save_config()
+
+    def get_preferred_dcc_mode(self, target_key: str, fallback: str = "") -> str:
+        """Returns the remembered default send mode for a DCC target, or fallback."""
+        return self.config.dcc_default_modes.get(target_key.strip()) or fallback
+
+    def set_preferred_dcc_mode(self, target_key: str, mode_id: str) -> None:
+        """Persists the preferred send mode for a DCC target without changing last_used_dcc_target."""
+        tkey = target_key.strip()
+        mid = mode_id.strip()
+        if tkey and mid and self.config.dcc_default_modes.get(tkey) != mid:
+            self.config.dcc_default_modes[tkey] = mid
+            self.save_config()
+
     def discover_client_root_projects(self) -> list[str]:
         """Scans the remembered Client Workspace Root for existing Obol project folders."""
         discovered: list[str] = []

@@ -34,6 +34,7 @@ def generate_control_token() -> str:
     return secrets.token_hex(32)
 
 _CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_CLI_VERSION_CACHE: dict[tuple[str, int, int], str] = {}
 
 
 def _exe_names(base: str) -> tuple[str, ...]:
@@ -338,6 +339,14 @@ class FilmCraftBridgeClient:
         if cli is None or not cli.is_file():
             return ""
         try:
+            st = cli.stat()
+            cache_key = (str(cli), st.st_mtime_ns, st.st_size)
+        except OSError:
+            cache_key = None
+        if cache_key is not None and cache_key in _CLI_VERSION_CACHE:
+            self._cached_cli_version = _CLI_VERSION_CACHE[cache_key]
+            return self._cached_cli_version
+        try:
             proc = subprocess.run(
                 [str(cli), "--version"],
                 capture_output=True,
@@ -351,6 +360,8 @@ class FilmCraftBridgeClient:
                 ver = proc.stdout.strip()
                 if ver:
                     self._cached_cli_version = ver
+                    if cache_key is not None:
+                        _CLI_VERSION_CACHE[cache_key] = ver
                     return ver
         except Exception:
             pass

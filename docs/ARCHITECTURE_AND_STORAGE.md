@@ -73,6 +73,13 @@ default_workspace_root = "D:/pROD/the_wkly"
 last_active_project = "wkly_41"
 author_name = "Dan Choi"
 fast_drop = false
+pinned_dcc_target = ""
+last_used_dcc_target = "reaper"
+
+[dcc_default_modes]
+reaper = "new_track"
+resolve = "media_pool"
+filmcraft = "project_bin"
 
 [vault]
 enabled = true
@@ -92,6 +99,7 @@ sidecar_extensions = []
 lock_previous_versions = true
 plugin = "reaper"
 ```
+*(The `pinned_dcc_target`, `last_used_dcc_target`, and `[dcc_default_modes]` fields persist the GUI DCC Exchange Bar's Auto/Pinned target choice and per-DCC send mode defaults.)*
 
 ### B. Component Snapshot (`<project>/.obol/tasks/<slug>/snapshot.toml`)
 Managed by `src/obol/core/storage.py` and modeled by `ComponentSnapshot`:

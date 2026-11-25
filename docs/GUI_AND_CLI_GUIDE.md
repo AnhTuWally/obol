@@ -32,10 +32,11 @@ To keep day-to-day navigation effortless and clutter-free, the main window uses 
    - **Tab 0 (`Working`)**: Multi-column table (`Version` | `Primary File` | `Created` | `Note`) showing `★` on latest and `🔒` on read-only locked versions. Double-click launches that exact working version; right-click offers `Open`, `Version Up from vNNN...`, `Publish from vNNN...`, `Save as Working Seed Template...`, `Open Folder`, `Copy Path`, and `Delete`.
    - **Tab 1 (`Repo Assets`)**: Horizontal `QSplitter` Master–Detail layout:
      - *Left (`self.repo_asset_tree`)*: Collapsible category folders (`audio/` → `lead_vocal`) showing `Ver` and `Used` counts, with `+ Slot` and `+ Ingest...`. Dropping onto empty space or a category folder creates a new named Repo Asset; dropping onto an existing asset adds `v(N+1)`.
-     - *Right (`self.repo_version_list`)*: Multi-column version list (`Version` | `File` | `Size` | `Note`) with double-click to open and right-click actions.
+     - *Right (`self.repo_version_list`)*: Multi-column version list (`Version` | `File` | `Size` | `Note`) supporting multi-selection, drag-out, double-click to open, and fast local right-click actions (`Open`, `+ Ingest New Version...`, `Open Version Folder`, `Copy File Path`, `Delete`).
    - **Tab 2 (`Published`)**: Horizontal `QSplitter` Master–Detail layout:
      - *Left (`self.published_deliverable_tree`)*: Named Deliverable streams (`main`, `stems`, `midi_pack`, etc.) with `+ Slot` and `+ Publish...` (`Ctrl+P`).
-     - *Right (`self.published_version_tree`)*: Expandable version tree (`Version / File` | `Types` | `Source / Size` | `Note`) showing format badges (`WAV, MID, MP3`), working lineage (`← working/v002`), child files (double-click to open), `1. Export Folder` / `2. Sync Exports` buttons for direct multi-format DCC exports, and right-click context menus.
+     - *Right (`self.published_version_tree`)*: Expandable version tree (`Version / File` | `Types` | `Source / Size` | `Note`) showing format badges (`WAV, MID, MP3`), working lineage (`← working/v002`), child files (double-click to open), `1. Export Folder` / `2. Sync Exports` buttons for direct multi-format DCC exports, multi-selection, and fast local right-click actions (`Open File`, `+ Attach More Files...`, `Open Release Folder`, `Copy Path`, `Delete`).
+   - **Dedicated DCC Exchange Bar (`QFrame#DccExchangeBar`)**: Docked cleanly at the bottom of Pane 2 below the Triad tabs with a **Target DCC** dropdown (`Auto → <Live DCC> ●` or pinned DCC), **Send Mode** dropdown (remembers your preferred insert mode per DCC), **`→ Send to <DCC>`** button (`Ctrl+D`), **`← Export (<DCC>)…`** button, and **`↻`** live status refresh button.
 
 6. **Pane 3 (Right) — Context-Aware Inspector & Actions**:
    - Automatically adapts to the active Triad tab (`Working Version`, `Repo Asset`, or `Published`):
@@ -44,7 +45,7 @@ To keep day-to-day navigation effortless and clutter-free, the main window uses 
      - **Contextual Actions**: `Open <Selected>` (launches the selected Working version, Repo file, or Published file), `Version Up + Open`, `Publish from Working...`, `Scan & Collect External .rpp Media` (for Reaper), `Open Folder`, `Copy Path`, granular Vault `Check Out Item` / `Offload Item` (when `VaultStatus.ONLINE`), and `Delete Selected...`.
 
 7. **Keyboard Shortcuts**:
-   - `Ctrl+N` New Project • `Ctrl+Shift+N` Add Component • `Ctrl+U` Version Up • `Ctrl+I` Ingest into active tab • `Ctrl+P` Publish • `Ctrl+S` Save Inspector Metadata • `F5` Refresh & Reconcile • `Delete` Delete focused item.
+   - `Ctrl+N` New Project • `Ctrl+Shift+N` Add Component • `Ctrl+U` Version Up • `Ctrl+I` Ingest into active tab • `Ctrl+P` Publish • `Ctrl+D` Send selected Repo/Published media via DCC Exchange Bar • `Ctrl+S` Save Inspector Metadata • `F5` Refresh & Reconcile • `Delete` Delete focused item.
 
 ---
 
@@ -86,9 +87,9 @@ To keep day-to-day navigation effortless and clutter-free, the main window uses 
 > On Windows, Qt's default `"windowsvista"` style draws native black tree branch expand/collapse arrows and white `QHeaderView` backgrounds when custom QSS dark backgrounds are used.
 >
 > To prevent dark-on-dark chevrons and white-on-white headers, `apply_studio_dark_theme()` in `src/obol/gui/theme.py`:
-> 1. Sets `app.setStyle("Fusion")` and applies a complete dark `QPalette`.
+> 1. Sets `app.setStyle("Fusion")` and applies a complete dark `QPalette` (guarded once per `QApplication` instance so opening dialogs or multiple windows stays fast).
 > 2. Generates high-contrast SVG chevron icons (`chevron_right.svg` in `#e4e4e7` and `chevron_down.svg` in `#60a5fa`) in `%TEMP%/obol_gui_icons/` and binds them to `QTreeView::branch` and `QComboBox::down-arrow`.
-> 3. Explicitly styles `QHeaderView::section` with a `#1f1f23` dark surface and `#d4d4d8` text, `[dragActive="true"]` drop highlights, `#DangerButton` delete buttons, compact `#DropHint` captions, and `#FormatChipActive`/`#FormatChipIdle` deliverable badges.
+> 3. Explicitly styles `QHeaderView::section` with a `#1f1f23` dark surface and `#d4d4d8` text, `[dragActive="true"]` drop highlights, `#DccExchangeBar` and dark `QMenu` popups, `#DangerButton` delete buttons, compact `#DropHint` captions, and `#FormatChipActive`/`#FormatChipIdle` deliverable badges.
 
 ---
 

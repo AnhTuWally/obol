@@ -323,6 +323,35 @@ QLineEdit#FilterInput {{
 QLineEdit#FilterInput:focus {{
     border-color: #3b82f6;
 }}
+QFrame#DccExchangeBar {{
+    background-color: #16161a;
+    border: 1px solid #27272a;
+    border-radius: 5px;
+}}
+QMenu {{
+    background-color: #18181b;
+    color: #f4f4f5;
+    border: 1px solid #3f3f46;
+    border-radius: 4px;
+    padding: 4px;
+}}
+QMenu::item {{
+    padding: 5px 22px 5px 12px;
+    border-radius: 3px;
+}}
+QMenu::item:selected {{
+    background-color: #1e3a8a;
+    color: #ffffff;
+}}
+QMenu::item:disabled {{
+    color: #71717a;
+    background-color: transparent;
+}}
+QMenu::separator {{
+    height: 1px;
+    background-color: #27272a;
+    margin: 4px 8px;
+}}
 """
 
 
@@ -332,7 +361,7 @@ STUDIO_DARK_STYLESHEET = get_studio_dark_stylesheet()
 def apply_studio_dark_theme(app_or_widget: object) -> None:
     """Applies Fusion style, dark QPalette, and high-contrast chevron/header QSS."""
     app = QApplication.instance()
-    if isinstance(app, QApplication):
+    if isinstance(app, QApplication) and not app.property("_obol_dark_theme_applied"):
         app.setStyle("Fusion")
         palette = QPalette()
         palette.setColor(QPalette.ColorRole.Window, QColor("#18181b"))
@@ -350,6 +379,7 @@ def apply_studio_dark_theme(app_or_widget: object) -> None:
         palette.setColor(QPalette.ColorRole.Mid, QColor("#a1a1aa"))
         palette.setColor(QPalette.ColorRole.Light, QColor("#71717a"))
         app.setPalette(palette)
+        app.setProperty("_obol_dark_theme_applied", True)
     if hasattr(app_or_widget, "setStyleSheet"):
         app_or_widget.setStyleSheet(get_studio_dark_stylesheet())
 
