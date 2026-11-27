@@ -61,6 +61,7 @@ from obol.gui.components import (
 from obol.gui.drop_widgets import DropTableWidget, extract_local_drop_paths
 from obol.gui.icons import get_icon
 from obol.gui.metadata_widgets import CustomMetadataEditor
+from obol.gui.software_icons import get_software_icon, resolve_software_icon
 from obol.gui.tokens import ACCENT_LIGHT, ICON_BTN_SIZE, ICON_SM, TEXT_MUTED, TEXT_SECONDARY, WARNING_BG, WARNING_TEXT
 
 
@@ -840,7 +841,7 @@ class AddComponentDialog(QDialog):
         self.software_combo = QComboBox()
         for sw_key in sorted(self.hub.config.software.keys()):
             prof = self.hub.config.software[sw_key]
-            self.software_combo.addItem(f"{prof.display_name} ({prof.key})", prof.key)
+            self.software_combo.addItem(get_software_icon(prof), f"{prof.display_name} ({prof.key})", prof.key)
 
         self.seed_combo = QComboBox()
 
@@ -994,6 +995,11 @@ class SoftwareSettingsDialog(QDialog):
         self.exe_edit = QLineEdit()
         self.exe_edit.setPlaceholderText("Optional path to .exe / app binary (blank = OS default)")
         exe_row = QHBoxLayout()
+        self.app_icon_preview = QLabel()
+        self.app_icon_preview.setFixedSize(32, 32)
+        self.app_icon_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.app_icon_preview.setToolTip("Icon shown on the Launch button for this software")
+        exe_row.addWidget(self.app_icon_preview)
         exe_row.addWidget(self.exe_edit, 1)
         browse_exe_btn = QPushButton("Browse…")
         browse_exe_btn.clicked.connect(self._browse_executable)
@@ -1003,6 +1009,14 @@ class SoftwareSettingsDialog(QDialog):
         exe_row.addWidget(auto_exe_btn)
         self.exe_status_label = QLabel("")
         self.exe_status_label.setObjectName("MutedText")
+
+        self.icon_edit = QLineEdit()
+        self.icon_edit.setPlaceholderText("Optional .ico / .png / .svg / .exe (blank = use executable's icon)")
+        icon_row = QHBoxLayout()
+        icon_row.addWidget(self.icon_edit, 1)
+        browse_icon_btn = QPushButton("Browse…")
+        browse_icon_btn.clicked.connect(self._browse_icon)
+        icon_row.addWidget(browse_icon_btn)
 
         self.ext_edit = QLineEdit()
         self.strategy_combo = QComboBox()
@@ -1018,6 +1032,7 @@ class SoftwareSettingsDialog(QDialog):
         form.addRow("Display Name:", self.name_edit)
         form.addRow("Executable Path:", exe_row)
         form.addRow("", self.exe_status_label)
+        form.addRow("Icon (optional):", icon_row)
         form.addRow("Extensions (comma-sep):", self.ext_edit)
         form.addRow("Version-Up Strategy:", self.strategy_combo)
         form.addRow("Ignore Patterns:", self.ignore_edit)
@@ -1046,8 +1061,35 @@ class SoftwareSettingsDialog(QDialog):
 
         layout.addWidget(right, 2)
         self.exe_edit.textChanged.connect(self._update_exe_status)
+        self.exe_edit.textChanged.connect(self._update_icon_preview)
+        self.icon_edit.textChanged.connect(self._update_icon_preview)
         self.sw_list.currentItemChanged.connect(self._on_list_item_changed)
         self._refresh_list()
+
+    def _browse_icon(self) -> None:
+        file_str, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Software Icon",
+            self.icon_edit.text().strip() or self.exe_edit.text().strip() or "",
+            "Icons & Apps (*.ico *.png *.svg *.exe *.icns);;All Files (*)",
+        )
+        if file_str:
+            self.icon_edit.setText(file_str)
+
+    def _update_icon_preview(self, *_args: object) -> None:
+        probe = SoftwareProfile(
+            key="preview",
+            display_name="preview",
+            executable=self.exe_edit.text().strip(),
+            icon=self.icon_edit.text().strip(),
+        )
+        icon = resolve_software_icon(probe)
+        if icon is None:
+            icon = get_icon("play", TEXT_MUTED, 20)
+            self.app_icon_preview.setToolTip("No app icon found — the Launch button will use the default glyph")
+        else:
+            self.app_icon_preview.setToolTip("Icon shown on the Launch button for this software")
+        self.app_icon_preview.setPixmap(icon.pixmap(QSize(28, 28)))
 
     def _browse_executable(self) -> None:
         file_str, _ = QFileDialog.getOpenFileName(
@@ -1094,6 +1136,7 @@ class SoftwareSettingsDialog(QDialog):
         self.key_edit.clear()
         self.name_edit.clear()
         self.exe_edit.clear()
+        self.icon_edit.clear()
         self.ext_edit.clear()
         self.ignore_edit.clear()
         self.strategy_combo.setCurrentIndex(0)
@@ -1107,7 +1150,7 @@ class SoftwareSettingsDialog(QDialog):
         target_row = 0
         for idx, k in enumerate(sorted(self.hub.config.software.keys())):
             prof = self.hub.config.software[k]
-            item = QListWidgetItem(f"{prof.display_name} [{k}]")
+            item = QListWidgetItem(get_software_icon(prof), f"{prof.display_name} [{k}]")
             item.setData(Qt.ItemDataRole.UserRole, k)
             self.sw_list.addItem(item)
             if select_key and k == select_key:
@@ -1130,6 +1173,7 @@ class SoftwareSettingsDialog(QDialog):
         self.key_edit.setText(prof.key)
         self.name_edit.setText(prof.display_name)
         self.exe_edit.setText(prof.executable)
+        self.icon_edit.setText(prof.icon)
         self.ext_edit.setText(", ".join(prof.extensions))
         strat_idx = self.strategy_combo.findData(prof.version_up_strategy.value)
         if strat_idx >= 0:
@@ -1156,6 +1200,7 @@ class SoftwareSettingsDialog(QDialog):
             ignore_patterns=ignores,
             lock_previous_versions=self.lock_chk.isChecked(),
             plugin=self.plugin_combo.currentText(),
+            icon=self.icon_edit.text().strip(),
         )
         self.hub.set_software_profile(prof)
         self._refresh_list(select_key=k)

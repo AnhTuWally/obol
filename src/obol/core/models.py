@@ -58,6 +58,8 @@ class SoftwareProfile:
     sidecar_extensions: list[str] = field(default_factory=list)
     lock_previous_versions: bool = True
     plugin: str = "generic"
+    # Optional .ico/.png/.svg/.exe path shown in the GUI; blank = auto (executable icon -> file-type icon)
+    icon: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return clean_for_toml({
@@ -72,6 +74,7 @@ class SoftwareProfile:
             "sidecar_extensions": self.sidecar_extensions,
             "lock_previous_versions": self.lock_previous_versions,
             "plugin": self.plugin,
+            "icon": self.icon,
         })
 
     @classmethod
@@ -93,6 +96,7 @@ class SoftwareProfile:
             sidecar_extensions=list(data.get("sidecar_extensions", [])),
             lock_previous_versions=bool(data.get("lock_previous_versions", True)),
             plugin=data.get("plugin", "generic"),
+            icon=str(data.get("icon", "") or ""),
         )
 
 

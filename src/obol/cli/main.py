@@ -227,6 +227,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=VersionUpStrategy.CLONE_PRIMARY_FILE.value,
         help="Version-Up strategy",
     )
+    p_swset.add_argument("--icon", default=None, help="Optional icon path (.ico/.png/.svg/.exe) shown in the GUI")
 
     # obol vault / push / archive / checkout
     p_vault = sub.add_parser("vault", help="Manage optional SMB / Network Server Vault connection")
@@ -923,6 +924,8 @@ def run_cli(argv: Optional[list[str]] = None, hub: Optional[ObolHub] = None) -> 
                 extensions=args.ext or [".txt"],
                 version_up_strategy=VersionUpStrategy(args.strategy),
             )
+            existing = active_hub.config.software.get(args.key)
+            prof.icon = args.icon if args.icon is not None else (existing.icon if existing else "")
             active_hub.set_software_profile(prof)
             print(f"Configured software profile '{prof.key}' (strategy: {prof.version_up_strategy.value})")
             return 0

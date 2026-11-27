@@ -72,6 +72,7 @@ from obol.gui.integrations_dialog import IntegrationsManagerDialog
 from obol.gui.metadata_widgets import CustomMetadataEditor
 from obol.gui.reaper_dialogs import ReaperExportPublishDialog, ReaperImportDialog
 from obol.gui.resolve_dialogs import ResolveExportPublishDialog
+from obol.gui.software_icons import get_software_icon, resolve_software_icon
 from obol.gui.theme import apply_studio_dark_theme
 from obol.gui.tokens import (
     ACCENT_LIGHT,
@@ -1414,7 +1415,7 @@ class ObolMainWindow(QMainWindow):
         self.insp_software_combo.clear()
         for k in sorted(self.hub.config.software.keys()):
             prof = self.hub.config.software[k]
-            self.insp_software_combo.addItem(f"{prof.display_name} ({k})", k)
+            self.insp_software_combo.addItem(get_software_icon(prof), f"{prof.display_name} ({k})", k)
         self.insp_software_combo.blockSignals(False)
 
         v_status = self.hub.get_vault_status()
@@ -2358,8 +2359,65 @@ class ObolMainWindow(QMainWindow):
         finally:
             self._meta_loading = False
             self._update_metadata_save_ui()
+            self._refresh_launch_btn_icon()
 
         self._refresh_dcc_target_ui(refresh_bridges=False)
+
+    def _launch_target_for_inspector(self) -> tuple[Optional[Any], Optional[Path]]:
+        """Mirrors _action_primary_open: returns (SoftwareProfile, file) the Launch button would open."""
+        snap = self.active_snapshot
+        if snap is None or not self.active_project_root or not self.active_component_path:
+            return None, None
+        comp_dir = self.active_project_root / self.active_component_path
+        tab_idx = self.triad_tabs.currentIndex()
+        rel: Optional[str] = None
+        if tab_idx == 1:
+            asset = snap.repo_assets.get(self.selected_repo_asset_path) if self.selected_repo_asset_path else None
+            ver = self._selected_repo_version()
+            if asset and ver is not None:
+                bundle = next((v for v in asset.versions if v.version == ver), None)
+                rel = bundle.primary_file if bundle and bundle.primary_file else None
+        elif tab_idx == 2:
+            target = self._selected_published_target()
+            if target is not None:
+                kind, dpath, ver, rel_path = target
+                if kind == "file" and rel_path:
+                    rel = rel_path
+                else:
+                    deliv = snap.published_deliverables.get(dpath)
+                    versions = snap.published_versions if dpath == "__legacy__" else (deliv.versions if deliv else [])
+                    bundle = next((v for v in versions if v.version == ver), None)
+                    rel = bundle.primary_file if bundle and bundle.primary_file else None
+        if rel:
+            target_file = comp_dir / rel
+            return self.hub.detect_software_for_extension(target_file.suffix), target_file
+
+        ver = self._selected_working_version()
+        if ver is not None:
+            w_bundle = next((v for v in snap.working_versions if v.version == ver), None)
+        else:
+            w_bundle = max(snap.working_versions, key=lambda v: v.version, default=None)
+        w_file = comp_dir / w_bundle.primary_file if w_bundle and w_bundle.primary_file else None
+        return self.hub.get_software_profile(snap.software), w_file
+
+    def _refresh_launch_btn_icon(self) -> None:
+        """Shows the target application's real icon on the Launch button (falls back to the play glyph)."""
+        icon = None
+        prof = None
+        if self.launch_btn.isEnabled():
+            try:
+                prof, target = self._launch_target_for_inspector()
+                icon = resolve_software_icon(prof, target) if prof is not None else None
+            except Exception:
+                icon = None
+        if icon is not None:
+            self.launch_btn.setIcon(icon)
+            self.launch_btn.setIconSize(QSize(18, 18))
+            self.launch_btn.setToolTip(f"Launches in {prof.display_name}" if prof else "")
+        else:
+            self.launch_btn.setIcon(get_icon("play", "#ffffff"))
+            self.launch_btn.setIconSize(QSize(13, 13))
+            self.launch_btn.setToolTip("")
 
     def _update_software_exe_hint(self, sw_key: str) -> None:
         prof = self.hub.get_software_profile(sw_key)
@@ -2398,6 +2456,7 @@ class ObolMainWindow(QMainWindow):
         save_component_snapshot(self.active_project_root, self.active_snapshot)
         self._update_software_exe_hint(sw_key)
         self._sync_software_action_visibility(sw_key)
+        self._refresh_launch_btn_icon()
 
         # Update software badge in component_tree immediately
         def _update_tree_item(item: QTreeWidgetItem) -> bool:
@@ -4277,6 +4336,18 @@ class ObolMainWindow(QMainWindow):
             if (self.active_snapshot and self.active_snapshot.software == "reaper")
             else None
         )
+        if self.active_snapshot and self.active_project_root and self.active_component_path:
+            w_bundle = next((v for v in self.active_snapshot.working_versions if v.version == ver), None)
+            w_file = (
+                self.active_project_root / self.active_component_path / w_bundle.primary_file
+                if w_bundle and w_bundle.primary_file
+                else None
+            )
+            app_icon = resolve_software_icon(self.hub.get_software_profile(self.active_snapshot.software), w_file)
+            if app_icon is not None:
+                act_open.setIcon(app_icon)
+                if act_open_tab is not None:
+                    act_open_tab.setIcon(app_icon)
         is_fc = bool(self.active_snapshot and self.active_snapshot.software == "filmcraft")
         act_fc_imp = menu.addAction("Import Media into FilmCraft…") if is_fc else None
         act_fc_pub = menu.addAction("Export && Publish from FilmCraft…") if is_fc else None
