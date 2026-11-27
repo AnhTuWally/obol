@@ -39,6 +39,13 @@ from obol.core.hub import ObolHub
 from obol.core.models import VersionBundle
 from obol.core.storage import discover_project_components, load_component_snapshot
 from obol.core.workspace import ObolWorkspace, WorkingFileContext
+from obol.gui.components import (
+    DCCAssetBrowserWidget,
+    DialogFooter,
+    confirm_destructive_action,
+    repolish,
+    run_with_busy_state,
+)
 from obol.gui.theme import apply_studio_dark_theme
 from obol.plugins.base import launch_file_with_profile
 from obol.plugins.reaper import ReaperPlugin
@@ -52,16 +59,11 @@ from obol.plugins.reaper_installer import ReaperInstaller
 from obol.plugins.reaper_scripts import OBOL_ACTION_SPECS
 
 
-def _repolish(widget: QWidget) -> None:
-    st = widget.style()
-    if st is not None:
-        st.unpolish(widget)
-        st.polish(widget)
-    widget.update()
+_repolish = repolish
 
 
 class ReaperOpenDialog(QDialog):
-    """Browse Obol projects/components/versions and open or version-up directly in REAPER."""
+    """Browse Obol projects/components/versions and open directly in REAPER."""
 
     def __init__(
         self,
@@ -121,19 +123,18 @@ class ReaperOpenDialog(QDialog):
         opts_row.addStretch()
         layout.addLayout(opts_row)
 
-        btns = QHBoxLayout()
-        self.vup_open_btn = QPushButton("Version Up && Open")
-        self.vup_open_btn.clicked.connect(self._on_vup_and_open)
         self.open_btn = QPushButton("Open in REAPER")
         self.open_btn.setObjectName("PrimaryButton")
         self.open_btn.clicked.connect(self._on_open_selected)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
-        btns.addStretch()
-        btns.addWidget(self.vup_open_btn)
-        btns.addWidget(self.open_btn)
-        btns.addWidget(cancel_btn)
-        layout.addLayout(btns)
+        layout.addWidget(
+            DialogFooter(
+                self,
+                cancel_button=cancel_btn,
+                primary_button=self.open_btn,
+            )
+        )
 
         self.project_combo.currentIndexChanged.connect(self._reload_components)
         self.comp_tree.currentItemChanged.connect(self._reload_versions)
@@ -240,18 +241,6 @@ class ReaperOpenDialog(QDialog):
         if raw_path:
             self._open_rpp_target(Path(raw_path))
 
-    def _on_vup_and_open(self) -> None:
-        proot = self._current_project_root()
-        comp_item = self.comp_tree.currentItem()
-        if not proot or comp_item is None:
-            return
-        comp = str(comp_item.data(0, Qt.ItemDataRole.UserRole) or "")
-        ver_item = self.ver_tree.currentItem()
-        src_v = int(ver_item.data(0, Qt.ItemDataRole.UserRole)) if ver_item is not None else None
-        bundle = self.workspace.version_up_working(proot, comp, source_version=src_v)
-        target_file = (proot / comp / bundle.primary_file).resolve()
-        self._open_rpp_target(target_file)
-
 
 class ReaperImportDialog(QDialog):
     """Browse repo/ & published/ deliverables to import into REAPER, and update outdated MIDI/media takes in the active session."""
@@ -299,37 +288,15 @@ class ReaperImportDialog(QDialog):
         tab_browse = QWidget()
         tb_layout = QVBoxLayout(tab_browse)
 
-        filter_row = QHBoxLayout()
-        filter_row.addWidget(QLabel("Project:"))
-        self.project_combo = QComboBox()
+        self.browser = DCCAssetBrowserWidget(self, search_placeholder="Filter assets or filenames…")
+        self.project_combo = self.browser.project_combo
         for p in self.hub.list_projects():
             self.project_combo.addItem(p.name, p.local_path)
-        filter_row.addWidget(self.project_combo)
-
-        filter_row.addWidget(QLabel("Scope:"))
-        self.scope_combo = QComboBox()
-        self.scope_combo.addItem("All Repo & Published", "all")
-        self.scope_combo.addItem("Current Component Repo", "repo")
-        self.scope_combo.addItem("Project Deliverables (Published)", "published")
-        filter_row.addWidget(self.scope_combo)
-
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Filter assets or filenames…")
-        self.search_edit.setClearButtonEnabled(True)
-        filter_row.addWidget(self.search_edit, 1)
-        tb_layout.addLayout(filter_row)
-
-        self.asset_tree = QTreeWidget()
-        self.asset_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.asset_tree.setAlternatingRowColors(True)
+        self.scope_combo = self.browser.scope_combo
+        self.search_edit = self.browser.search_edit
+        self.asset_tree = self.browser.asset_tree
         self.asset_tree.setHeaderLabels(["File / Asset", "Kind", "Component", "Version", "Note"])
-        self.asset_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.asset_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.asset_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.asset_tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.asset_tree.header().setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
-        self.asset_tree.setColumnWidth(4, 180)
-        tb_layout.addWidget(self.asset_tree, 1)
+        tb_layout.addWidget(self.browser, 1)
 
         import_row = QHBoxLayout()
         import_row.addWidget(QLabel("Insert Mode:"))
@@ -987,16 +954,12 @@ class ReaperExportPublishDialog(QDialog):
         layout.addWidget(self.collect_before_chk)
         layout.addWidget(self.vup_after_chk)
 
-        btns = QHBoxLayout()
-        btns.addStretch()
         self.export_btn = QPushButton("Export && Publish")
         self.export_btn.setObjectName("PrimaryButton")
         self.export_btn.clicked.connect(self._on_execute)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
-        btns.addWidget(self.export_btn)
-        btns.addWidget(cancel_btn)
-        layout.addLayout(btns)
+        layout.addWidget(DialogFooter(self, cancel_button=cancel_btn, primary_button=self.export_btn))
 
         self.method_combo.currentIndexChanged.connect(self.method_stack.setCurrentIndex)
         self.project_combo.currentIndexChanged.connect(self._reload_components)
@@ -1102,11 +1065,28 @@ class ReaperExportPublishDialog(QDialog):
             )
             return
 
-        try:
-            if self.bridge.is_connected() and self.save_before_chk.isChecked() and method in ("direct", "native_dialog"):
+        if method == "existing":
+            files = [Path(self.existing_files_list.item(i).text()) for i in range(self.existing_files_list.count())]
+            if not files:
+                QMessageBox.warning(self, "Publish Files", "Add at least one file to publish.")
+                return
+        else:
+            files = []
+
+        save_before = self.save_before_chk.isChecked()
+        collect_before = self.collect_before_chk.isChecked()
+        vup_after = self.vup_after_chk.isChecked()
+        direct_pattern = self.direct_pattern_edit.text().strip()
+        render_mode = str(self.render_source_combo.currentData() or "master")
+        bounds = str(self.render_bounds_combo.currentData() or "entire")
+        preset_name = str(self.preset_combo.currentData() or "")
+        native_pattern = self.native_pattern_edit.text().strip()
+
+        def _work() -> Optional[VersionBundle]:
+            if self.bridge.is_connected() and save_before and method in ("direct", "native_dialog"):
                 self.bridge.save_project()
 
-            if self.collect_before_chk.isChecked() and self._ctx:
+            if collect_before and self._ctx:
                 collected = self.workspace.collect_external_dependencies(
                     proot, comp, working_version=work_ver
                 )
@@ -1114,10 +1094,6 @@ class ReaperExportPublishDialog(QDialog):
                     self.bridge.reload_project(Path(self.active_rpp))
 
             if method == "existing":
-                files = [Path(self.existing_files_list.item(i).text()) for i in range(self.existing_files_list.count())]
-                if not files:
-                    QMessageBox.warning(self, "Publish Files", "Add at least one file to publish.")
-                    return
                 bundle = self.workspace.publish_version(
                     project_root=proot,
                     component_path=comp,
@@ -1133,21 +1109,18 @@ class ReaperExportPublishDialog(QDialog):
                     proot, comp, deliverable_name=deliv_name, target_version=target_ver
                 )
                 if method == "direct":
-                    pattern = self.direct_pattern_edit.text().strip()
-                    if not pattern:
-                        src_mode = str(self.render_source_combo.currentData() or "master")
-                        pattern = "$track" if src_mode == "stems_selected" else f"{deliv_path}_v{ver_num:03d}"
+                    pattern = direct_pattern or ("$track" if render_mode == "stems_selected" else f"{deliv_path}_v{ver_num:03d}")
                     self.bridge.render_direct(
                         output_dir=export_dir,
                         pattern=pattern,
-                        render_mode=str(self.render_source_combo.currentData() or "master"),
-                        bounds=str(self.render_bounds_combo.currentData() or "entire"),
-                        preset_name=str(self.preset_combo.currentData() or ""),
+                        render_mode=render_mode,
+                        bounds=bounds,
+                        preset_name=preset_name,
                     )
                 else:
                     self.bridge.open_render_dialog(
                         output_dir=export_dir,
-                        pattern=self.native_pattern_edit.text().strip(),
+                        pattern=native_pattern,
                         restore_after=True,
                     )
 
@@ -1162,12 +1135,7 @@ class ReaperExportPublishDialog(QDialog):
                 if bundle is None:
                     if export_dir.is_dir() and not any(export_dir.iterdir()):
                         export_dir.rmdir()
-                    QMessageBox.information(
-                        self,
-                        "Export Cancelled",
-                        "No rendered files were found in the export folder.",
-                    )
-                    return
+                    return None
                 if tags:
                     self.workspace.update_published_metadata(
                         project_root=proot,
@@ -1177,7 +1145,7 @@ class ReaperExportPublishDialog(QDialog):
                         tags=list(dict.fromkeys(list(bundle.tags) + tags)),
                     )
 
-            if self.vup_after_chk.isChecked():
+            if vup_after:
                 next_bundle = self.workspace.version_up_working(
                     proot,
                     comp,
@@ -1187,6 +1155,16 @@ class ReaperExportPublishDialog(QDialog):
                 if self.bridge.is_connected():
                     self.bridge.open_project((proot / comp / next_bundle.primary_file).resolve(), noprompt=True)
 
+            return bundle
+
+        def _on_success(bundle: Optional[VersionBundle]) -> None:
+            if bundle is None:
+                QMessageBox.information(
+                    self,
+                    "Export Cancelled",
+                    "No rendered files were found in the export folder.",
+                )
+                return
             self.published_bundle = bundle
             QMessageBox.information(
                 self,
@@ -1194,8 +1172,17 @@ class ReaperExportPublishDialog(QDialog):
                 f"Published {comp}/published/{deliv_name}/{bundle.version_label} ({len(bundle.files)} file(s))!",
             )
             self.accept()
-        except Exception as exc:
+
+        def _on_error(exc: Exception) -> None:
             QMessageBox.warning(self, "Export & Publish Failed", str(exc))
+
+        run_with_busy_state(
+            self,
+            _work,
+            on_success=_on_success,
+            on_error=_on_error,
+            disable_widgets=[self.export_btn],
+        )
 
 
 class ReaperIntegrationDialog(QDialog):
@@ -1340,7 +1327,14 @@ class ReaperIntegrationDialog(QDialog):
         except Exception as exc:
             QMessageBox.warning(self, "Install Failed", str(exc))
 
-    def _on_uninstall(self) -> None:
+    def _on_uninstall(self, confirm: bool = True) -> None:
+        if confirm and not confirm_destructive_action(
+            self,
+            "Uninstall REAPER Integration",
+            "Remove Obol REAPER scripts and startup hooks?",
+            confirm_label="Uninstall",
+        ):
+            return
         res_txt = self.res_dir_edit.text().strip()
         res_dir = Path(res_txt) if res_txt else None
         self.installer.uninstall(resource_dir=res_dir)
@@ -1382,7 +1376,9 @@ def launch_reaper_dialog(
             default_component=component,
         )
     else:
-        dlg = ReaperIntegrationDialog(None, hub, bridge)
+        from obol.gui.integrations_dialog import IntegrationsManagerDialog
+
+        dlg = IntegrationsManagerDialog(None, hub, initial_dcc="reaper")
 
     dlg.exec()
     return 0

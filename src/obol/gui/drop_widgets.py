@@ -18,9 +18,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from obol.gui.tokens import ACCENT_BORDER, ACCENT_LIGHT, BG_BUTTON_HOVER, TEXT_MUTED, TEXT_SECONDARY
+
 
 def _paint_empty_placeholder(widget: QAbstractItemView, title: str, subtitle: str) -> None:
-    """Draws centered onboarding/drop hint text inside an empty list or tree viewport."""
+    """Draws centered onboarding/drop hint card inside an empty list or tree viewport."""
     if not title and not subtitle:
         return
     vp = widget.viewport()
@@ -29,26 +31,39 @@ def _paint_empty_placeholder(widget: QAbstractItemView, title: str, subtitle: st
     painter = QPainter(vp)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing)
     drag_active = bool(widget.property("dragActive"))
-    title_color = QColor("#93c5fd") if drag_active else QColor("#a1a1aa")
-    sub_color = QColor("#bfdbfe") if drag_active else QColor("#71717a")
+    title_color = QColor(ACCENT_LIGHT) if drag_active else QColor(TEXT_SECONDARY)
+    sub_color = QColor("#bfdbfe") if drag_active else QColor(TEXT_MUTED)
+    border_color = QColor(ACCENT_BORDER) if drag_active else QColor(BG_BUTTON_HOVER)
 
-    rect = vp.rect().adjusted(24, 16, -24, -16)
+    rect = vp.rect().adjusted(28, 24, -28, -24)
+    if rect.width() > 140 and rect.height() > 90:
+        pen = painter.pen()
+        pen.setColor(border_color)
+        pen.setWidth(1)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        box_w = min(rect.width(), 380)
+        box_h = min(rect.height(), 116)
+        box_x = rect.center().x() - box_w // 2
+        box_y = rect.center().y() - box_h // 2
+        painter.drawRoundedRect(box_x, box_y, box_w, box_h, 8, 8)
+
     center_y = rect.center().y()
     title_font = QFont(widget.font())
     title_font.setBold(True)
     title_font.setPointSize(max(10, title_font.pointSize() + 1))
     painter.setFont(title_font)
     painter.setPen(title_color)
-    painter.drawText(rect.left(), center_y - 24, rect.width(), 24, Qt.AlignmentFlag.AlignCenter, title)
+    painter.drawText(rect.left(), center_y - 22, rect.width(), 24, Qt.AlignmentFlag.AlignCenter, title)
 
     if subtitle:
         sub_font = QFont(widget.font())
         painter.setFont(sub_font)
         painter.setPen(sub_color)
         painter.drawText(
-            rect.left(),
-            center_y + 2,
-            rect.width(),
+            rect.left() + 12,
+            center_y + 4,
+            max(40, rect.width() - 24),
             44,
             Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignTop | Qt.TextFlag.TextWordWrap,
             subtitle,
@@ -100,25 +115,25 @@ class DropListWidget(QListWidget):
         if self.viewport() is not None:
             self.viewport().update()
 
-    def count(self) -> int:
-        """List-compatible helper returning top-level row count."""
-        return self.topLevelItemCount()
-
-    def currentRow(self) -> int:
-        """List-compatible helper returning index of selected top-level item."""
-        curr = self.currentItem()
-        return self.indexOfTopLevelItem(curr) if curr is not None else -1
-
-    def setCurrentRow(self, row: int) -> None:
-        """List-compatible helper selecting a top-level item by row index."""
-        item = self.topLevelItem(row)
-        if item is not None:
-            self.setCurrentItem(item)
-
     def paintEvent(self, event: QPaintEvent) -> None:
         super().paintEvent(event)
-        if self.count() == 0 and (self._empty_title or self._empty_subtitle):
-            _paint_empty_placeholder(self, self._empty_title, self._empty_subtitle)
+        total = self.topLevelItemCount()
+        if total == 0:
+            if self._empty_title or self._empty_subtitle:
+                _paint_empty_placeholder(self, self._empty_title, self._empty_subtitle)
+        elif self._filter_active:
+            all_hidden = all(
+                self.topLevelItem(i).isHidden()
+                for i in range(total)
+                if self.topLevelItem(i) is not None
+            )
+            if all_hidden:
+                title = (
+                    f"No matches for '{self._filter_query}'"
+                    if self._filter_query
+                    else "No matching items"
+                )
+                _paint_empty_placeholder(self, title, "Clear the search filter to show all items")
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if extract_local_drop_paths(event):
@@ -160,11 +175,20 @@ class DropTreeWidget(QTreeWidget):
         self.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
         self._empty_title: str = ""
         self._empty_subtitle: str = ""
+        self._filter_active: bool = False
+        self._filter_query: str = ""
         self._drag_path_resolver: Optional[Callable[[QTreeWidgetItem], Optional[Path]]] = None
 
     def set_empty_placeholder(self, title: str, subtitle: str = "") -> None:
         self._empty_title = title
         self._empty_subtitle = subtitle
+        if self.viewport() is not None:
+            self.viewport().update()
+
+    def set_filter_active(self, active: bool, query: str = "") -> None:
+        """Marks whether an active search filter is hiding items so empty results can be painted."""
+        self._filter_active = bool(active)
+        self._filter_query = query.strip()
         if self.viewport() is not None:
             self.viewport().update()
 
@@ -230,8 +254,23 @@ class DropTreeWidget(QTreeWidget):
 
     def paintEvent(self, event: QPaintEvent) -> None:
         super().paintEvent(event)
-        if self.count() == 0 and (self._empty_title or self._empty_subtitle):
-            _paint_empty_placeholder(self, self._empty_title, self._empty_subtitle)
+        total = self.topLevelItemCount()
+        if total == 0:
+            if self._empty_title or self._empty_subtitle:
+                _paint_empty_placeholder(self, self._empty_title, self._empty_subtitle)
+        elif self._filter_active:
+            all_hidden = all(
+                self.topLevelItem(i).isHidden()
+                for i in range(total)
+                if self.topLevelItem(i) is not None
+            )
+            if all_hidden:
+                title = (
+                    f"No matches for '{self._filter_query}'"
+                    if self._filter_query
+                    else "No matching items"
+                )
+                _paint_empty_placeholder(self, title, "Clear the search filter to show all items")
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if self._is_internal_source(event):

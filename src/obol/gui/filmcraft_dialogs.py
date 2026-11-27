@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 from typing import Any, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QColor, QIcon
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -38,16 +38,19 @@ from obol.core.hub import ObolHub
 from obol.core.models import VersionBundle
 from obol.core.storage import discover_project_components, load_component_snapshot
 from obol.core.workspace import ObolWorkspace
+from obol.gui.components import (
+    DCCAssetBrowserWidget,
+    DialogFooter,
+    repolish,
+    run_with_busy_state,
+)
+from obol.gui.icons import get_icon
 from obol.gui.theme import apply_studio_dark_theme
+from obol.gui.tokens import ICON_SM, TEXT_SECONDARY
 from obol.plugins.filmcraft_bridge import FilmCraftBridgeClient
 
 
-def _repolish(widget: QWidget) -> None:
-    st = widget.style()
-    if st is not None:
-        st.unpolish(widget)
-        st.polish(widget)
-    widget.update()
+_repolish = repolish
 
 
 def _resolve_working_fcproj_paths(
@@ -117,37 +120,15 @@ class FilmCraftImportDialog(QDialog):
         tab_imp = QWidget()
         ti_layout = QVBoxLayout(tab_imp)
 
-        filter_row = QHBoxLayout()
-        filter_row.addWidget(QLabel("Project:"))
-        self.project_combo = QComboBox()
+        self.browser = DCCAssetBrowserWidget(self, search_placeholder="Filter video, audio, stills, captions…")
+        self.project_combo = self.browser.project_combo
         for p in self.hub.list_projects():
             self.project_combo.addItem(p.name, p.local_path)
-        filter_row.addWidget(self.project_combo)
-
-        filter_row.addWidget(QLabel("Scope:"))
-        self.scope_combo = QComboBox()
-        self.scope_combo.addItem("All Repo & Published", "all")
-        self.scope_combo.addItem("Component Repo Only", "repo")
-        self.scope_combo.addItem("Published Deliverables Only", "published")
-        filter_row.addWidget(self.scope_combo)
-
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Filter video, audio, stills, captions…")
-        self.search_edit.setClearButtonEnabled(True)
-        filter_row.addWidget(self.search_edit, 1)
-        ti_layout.addLayout(filter_row)
-
-        self.asset_tree = QTreeWidget()
-        self.asset_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.asset_tree.setAlternatingRowColors(True)
+        self.scope_combo = self.browser.scope_combo
+        self.search_edit = self.browser.search_edit
+        self.asset_tree = self.browser.asset_tree
         self.asset_tree.setHeaderLabels(["File / Asset", "Kind", "Component", "Version", "Note"])
-        self.asset_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.asset_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.asset_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.asset_tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.asset_tree.header().setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
-        self.asset_tree.setColumnWidth(4, 180)
-        ti_layout.addWidget(self.asset_tree, 1)
+        ti_layout.addWidget(self.browser, 1)
 
         opts_form = QFormLayout()
         self.bin_combo = QComboBox()
@@ -495,8 +476,10 @@ class FilmCraftExportPublishDialog(QDialog):
         seq_row = QHBoxLayout()
         seq_row.addWidget(QLabel("Sequence:"))
         self.sequence_combo = QComboBox()
-        self.refresh_seq_btn = QPushButton("↻ Refresh")
+        self.refresh_seq_btn = QPushButton("Refresh")
         self.refresh_seq_btn.setObjectName("SubtleToolButton")
+        self.refresh_seq_btn.setIcon(get_icon("refresh", TEXT_SECONDARY, ICON_SM))
+        self.refresh_seq_btn.setIconSize(QSize(ICON_SM, ICON_SM))
         self.refresh_seq_btn.clicked.connect(self._reload_sequences)
         seq_row.addWidget(self.sequence_combo, 1)
         seq_row.addWidget(self.refresh_seq_btn)
@@ -522,7 +505,10 @@ class FilmCraftExportPublishDialog(QDialog):
         self.format_combo = QComboBox()
         self.format_combo.addItems(["h264", "hevc", "prores", "dnxhr", "wav", "mp3", "flac", "png", "exr", "gif"])
         self.range_combo = QComboBox()
-        self.range_combo.addItems(["entire", "inOut", "workArea", "custom"])
+        self.range_combo.addItem("Entire Sequence", "entire")
+        self.range_combo.addItem("In / Out Range", "inOut")
+        self.range_combo.addItem("Work Area", "workArea")
+        self.range_combo.addItem("Custom Range", "custom")
         range_custom_row = QHBoxLayout()
         self.start_sec_spin = QDoubleSpinBox()
         self.start_sec_spin.setRange(0.0, 86400.0)
@@ -535,6 +521,8 @@ class FilmCraftExportPublishDialog(QDialog):
         range_custom_row.addWidget(self.start_sec_spin)
         range_custom_row.addWidget(QLabel("End (s):"))
         range_custom_row.addWidget(self.end_sec_spin)
+        self.range_combo.currentIndexChanged.connect(self._on_range_changed)
+        self._on_range_changed()
         self.scale_combo = QComboBox()
         self.scale_combo.addItem("100% (1.0)", 1.0)
         self.scale_combo.addItem("50% (0.5)", 0.5)
@@ -581,16 +569,12 @@ class FilmCraftExportPublishDialog(QDialog):
 
         layout.addWidget(self.method_stack, 1)
 
-        btns = QHBoxLayout()
-        btns.addStretch()
         self.export_btn = QPushButton("Export && Publish")
         self.export_btn.setObjectName("PrimaryButton")
         self.export_btn.clicked.connect(self._on_execute)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
-        btns.addWidget(self.export_btn)
-        btns.addWidget(cancel_btn)
-        layout.addLayout(btns)
+        layout.addWidget(DialogFooter(self, cancel_button=cancel_btn, primary_button=self.export_btn))
 
         self.method_combo.currentIndexChanged.connect(self.method_stack.setCurrentIndex)
         self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
@@ -645,6 +629,11 @@ class FilmCraftExportPublishDialog(QDialog):
         pdata = self.preset_combo.currentData()
         has_preset = isinstance(pdata, dict)
         self.format_combo.setEnabled(not has_preset)
+
+    def _on_range_changed(self) -> None:
+        is_custom = str(self.range_combo.currentData() or "") == "custom"
+        self.start_sec_spin.setEnabled(is_custom)
+        self.end_sec_spin.setEnabled(is_custom)
 
     def _current_target(self) -> tuple[str, Optional[Path], str, int, Optional[Path]]:
         pname = self.project_combo.currentText()
@@ -790,15 +779,26 @@ class FilmCraftExportPublishDialog(QDialog):
         seq_id = self.sequence_combo.currentData()
         mode = str(self.method_combo.currentData() or "media")
 
-        try:
+        pdata = self.preset_combo.currentData()
+        fmt_choice = self.format_combo.currentText()
+        range_mode = str(self.range_combo.currentData() or "entire")
+        start_sec = self.start_sec_spin.value()
+        end_sec = self.end_sec_spin.value()
+        scale_val = float(self.scale_combo.currentData() or 1.0)
+        no_audio = not self.include_audio_chk.isChecked()
+        allow_offline = self.allow_offline_chk.isChecked()
+        still_seconds = self.still_seconds_spin.value()
+        still_scale = float(self.still_scale_combo.currentData() or 1.0)
+        still_allow_offline = self.still_allow_offline_chk.isChecked()
+        inter_fmt = self.inter_fmt_combo.currentText()
+
+        def _work() -> VersionBundle:
             if mode == "media":
-                pdata = self.preset_combo.currentData()
                 preset_name = str(pdata.get("name") or "") if isinstance(pdata, dict) else ""
-                fmt = "" if preset_name else self.format_combo.currentText()
+                fmt = "" if preset_name else fmt_choice
                 ext = str(pdata.get("extension") or "") if isinstance(pdata, dict) else self._extension_for_format(fmt)
                 ext = ext.lstrip(".") or "mp4"
                 out_file = export_dir / f"{base_name}.{ext}"
-                range_mode = self.range_combo.currentText()
                 self.bridge.export_media(
                     out_file,
                     project_path=proj_arg,
@@ -806,30 +806,29 @@ class FilmCraftExportPublishDialog(QDialog):
                     fmt=fmt,
                     sequence_id=int(seq_id) if seq_id is not None else None,
                     range_mode=range_mode,
-                    start_seconds=self.start_sec_spin.value() if range_mode == "custom" else None,
-                    end_seconds=self.end_sec_spin.value() if range_mode == "custom" else None,
-                    scale=float(self.scale_combo.currentData() or 1.0),
-                    no_audio=not self.include_audio_chk.isChecked(),
-                    allow_offline=self.allow_offline_chk.isChecked(),
+                    start_seconds=start_sec if range_mode == "custom" else None,
+                    end_seconds=end_sec if range_mode == "custom" else None,
+                    scale=scale_val,
+                    no_audio=no_audio,
+                    allow_offline=allow_offline,
                     use_bridge=use_live,
                 )
             elif mode == "still":
                 out_file = export_dir / f"{base_name}_still.png"
                 self.bridge.render_still(
                     out_file,
-                    seconds=self.still_seconds_spin.value(),
-                    scale=float(self.still_scale_combo.currentData() or 1.0),
+                    seconds=still_seconds,
+                    scale=still_scale,
                     project_path=proj_arg,
-                    allow_offline=self.still_allow_offline_chk.isChecked(),
+                    allow_offline=still_allow_offline,
                     use_bridge=use_live,
                 )
             else:
-                ifmt = self.inter_fmt_combo.currentText()
-                ext = self._extension_for_format(ifmt)
+                ext = self._extension_for_format(inter_fmt)
                 out_file = export_dir / f"{base_name}.{ext}"
                 self.bridge.export_interchange(
                     out_file,
-                    fmt=ifmt,
+                    fmt=inter_fmt,
                     sequence_id=int(seq_id) if seq_id is not None else None,
                     project_path=proj_arg,
                     use_bridge=use_live,
@@ -846,8 +845,7 @@ class FilmCraftExportPublishDialog(QDialog):
             if bundle is None:
                 if export_dir.is_dir() and not any(export_dir.iterdir()):
                     export_dir.rmdir()
-                QMessageBox.warning(self, "Export Empty", "No output file was produced in the export folder.")
-                return
+                raise RuntimeError("No output file was produced in the export folder.")
             if tags:
                 self.workspace.update_published_metadata(
                     project_root=proot,
@@ -856,6 +854,9 @@ class FilmCraftExportPublishDialog(QDialog):
                     version=bundle.version,
                     tags=list(dict.fromkeys(list(bundle.tags) + tags)),
                 )
+            return bundle
+
+        def _on_success(bundle: VersionBundle) -> None:
             self.published_bundle = bundle
             QMessageBox.information(
                 self,
@@ -863,10 +864,20 @@ class FilmCraftExportPublishDialog(QDialog):
                 f"Published {comp}/published/{deliv_path}/{bundle.version_label} ({len(bundle.files)} file(s))!",
             )
             self.accept()
-        except Exception as exc:
+
+        def _on_error(exc: Exception) -> None:
             if export_dir.is_dir() and not any(export_dir.iterdir()):
                 export_dir.rmdir()
-            QMessageBox.warning(self, "FilmCraft Export & Publish Failed", str(exc))
+            title = "Export Empty" if "No output file" in str(exc) else "FilmCraft Export & Publish Failed"
+            QMessageBox.warning(self, title, str(exc))
+
+        run_with_busy_state(
+            self,
+            _work,
+            on_success=_on_success,
+            on_error=_on_error,
+            disable_widgets=[self.export_btn],
+        )
 
 
 def launch_filmcraft_dialog(

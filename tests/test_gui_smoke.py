@@ -74,13 +74,20 @@ class TestGuiAndCliSmoke(unittest.TestCase):
                     "InspectorJ",
                     "--source",
                     "freesound.org",
+                    "--url",
+                    "https://freesound.org/s/123/",
                     "--license",
                     "CC-BY-4.0",
+                    "--meta",
+                    "bpm=128",
                 ],
                 hub=self.hub,
             ),
             0,
         )
+        cli_snap = load_component_snapshot(client_root / "cli_album", "song_1/vocals")
+        self.assertEqual(cli_snap.repo_assets["audio/sample"].url, "https://freesound.org/s/123/")
+        self.assertEqual(cli_snap.repo_assets["audio/sample"].custom.get("bpm"), "128")
         self.assertEqual(
             run_cli(["work", "up", "song_1/vocals", "-p", "cli_album", "-m", "v2 arrangement"], hub=self.hub),
             0,
@@ -358,6 +365,176 @@ class TestGuiAndCliSmoke(unittest.TestCase):
         self.assertTrue(cred_dlg.table.isRowHidden(0))
         cred_dlg.filter_edit.clear()
         self.assertFalse(cred_dlg.table.isRowHidden(0))
+
+        # 7. Contextual Inspector action scoping across tabs
+        win.triad_tabs.setCurrentIndex(0)
+        self.assertFalse(win.working_actions_box.isHidden())
+        self.assertTrue(win.repo_actions_box.isHidden())
+        self.assertTrue(win.published_actions_box.isHidden())
+
+        win.triad_tabs.setCurrentIndex(1)
+        self.assertTrue(win.working_actions_box.isHidden())
+        self.assertFalse(win.repo_actions_box.isHidden())
+        self.assertTrue(win.published_actions_box.isHidden())
+
+        win.triad_tabs.setCurrentIndex(2)
+        self.assertTrue(win.working_actions_box.isHidden())
+        self.assertTrue(win.repo_actions_box.isHidden())
+        self.assertFalse(win.published_actions_box.isHidden())
+
+        # 8. In-tab search filters for Working, Repo Assets, and Published
+        win.triad_tabs.setCurrentIndex(0)
+        win.working_filter_edit.setText("nonexistent_v")
+        self.assertTrue(win.working_list.topLevelItem(0).isHidden())
+        win.working_filter_edit.clear()
+        self.assertFalse(win.working_list.topLevelItem(0).isHidden())
+
+        win.triad_tabs.setCurrentIndex(1)
+        win.repo_filter_edit.setText("nonexistent_asset")
+        self.assertTrue(win.repo_asset_tree.topLevelItem(0).isHidden())
+        win.repo_filter_edit.clear()
+        self.assertFalse(win.repo_asset_tree.topLevelItem(0).isHidden())
+
+        win.triad_tabs.setCurrentIndex(2)
+        win.pub_filter_edit.setText("nonexistent_deliv")
+        self.assertTrue(win.published_deliverable_tree.topLevelItem(0).isHidden())
+        win.pub_filter_edit.clear()
+        self.assertFalse(win.published_deliverable_tree.topLevelItem(0).isHidden())
+
+        # 9. Group-node selection switches workspace_stack to Group Overview and back
+        song_group = next(
+            win.component_tree.topLevelItem(i)
+            for i in range(win.component_tree.topLevelItemCount())
+            if win.component_tree.topLevelItem(i).text(0) == "song_1/"
+        )
+        win.component_tree.setCurrentItem(song_group)
+        self.assertEqual(win.workspace_stack.currentIndex(), 1)
+        self.assertGreater(win.group_children_list.count(), 0)
+        win._on_group_child_activated(win.group_children_list.item(0))
+        self.assertEqual(win.workspace_stack.currentIndex(), 0)
+
+        # 10. Instant Version Up (no modal prompt)
+        from unittest.mock import patch
+
+        win.triad_tabs.setCurrentIndex(0)
+        before_vers = len(load_component_snapshot(proj_root, win.active_component_path).working_versions)
+        with patch("obol.gui.app.QInputDialog.getText", side_effect=AssertionError("Version Up must not prompt")):
+            win._action_version_up_working()
+        after_vers = len(load_component_snapshot(proj_root, win.active_component_path).working_versions)
+        self.assertEqual(after_vers, before_vers + 1)
+
+        # 11. Auto-save metadata ON by default + toggleable OFF in Settings
+        from obol.core.models import GlobalConfig
+
+        self.assertTrue(GlobalConfig.from_dict({}).auto_save_metadata)
+        self.assertTrue(win.hub.config.auto_save_metadata)
+        win.insp_comment_edit.setText("Auto-saved note")
+        win._on_metadata_field_edited()
+        self.assertTrue(win._meta_dirty)
+        win._on_metadata_editing_finished()
+        self.assertFalse(win._meta_dirty)
+        latest_v = load_component_snapshot(proj_root, win.active_component_path).working_versions[-1]
+        self.assertEqual(latest_v.comment, "Auto-saved note")
+
+        win.auto_save_meta_action.setChecked(False)
+        self.assertFalse(win.hub.config.auto_save_metadata)
+        win.insp_comment_edit.setText("Manual unsaved draft")
+        win._on_metadata_field_edited()
+        self.assertTrue(win._meta_dirty)
+        win._on_metadata_editing_finished()
+        self.assertTrue(win._meta_dirty)
+        self.assertEqual(
+            load_component_snapshot(proj_root, win.active_component_path).working_versions[-1].comment,
+            "Auto-saved note",
+        )
+        win._save_inspector_metadata(silent_refresh=False)
+        self.assertFalse(win._meta_dirty)
+        self.assertEqual(
+            load_component_snapshot(proj_root, win.active_component_path).working_versions[-1].comment,
+            "Manual unsaved draft",
+        )
+        # 12. Repo URL, Custom Metadata Editor, Copy & Paste across entities, SmartIngest & CreditsReport
+        # First preserve seed_template on working version when editing custom metadata
+        win.triad_tabs.setCurrentIndex(0)
+        win.insp_custom_meta.add_row("mood", "energetic", focus_key=False)
+        win._save_inspector_metadata(silent_refresh=False)
+        snap = load_component_snapshot(proj_root, win.active_component_path)
+        self.assertEqual(snap.working_versions[-1].custom.get("mood"), "energetic")
+
+        # Set URL + custom fields on audio/bass and copy metadata
+        snare_wav = self.root / "snare.wav"
+        snare_wav.write_bytes(b"SNARE")
+        self.ws.ingest_repo_asset(proj_root, win.active_component_path, snare_wav, asset_path="audio/snare")
+        win._refresh_component_triad()
+        win.triad_tabs.setCurrentIndex(1)
+        win.selected_repo_asset_path = "audio/bass"
+        win._refresh_component_triad()
+        win.insp_url_edit.setText("https://example.com/packs/bass-di")
+        k_ed, v_ed = win.insp_custom_meta.add_row("bpm", "120", focus_key=False)
+        self.assertEqual(k_ed.text(), "bpm")
+        self.assertEqual(v_ed.text(), "120")
+        win._save_inspector_metadata(silent_refresh=False)
+
+        snap = load_component_snapshot(proj_root, win.active_component_path)
+        self.assertEqual(snap.repo_assets["audio/bass"].url, "https://example.com/packs/bass-di")
+        self.assertEqual(snap.repo_assets["audio/bass"].custom, {"bpm": "120"})
+
+        # Copy from audio/bass -> Paste to audio/snare
+        win._action_copy_metadata()
+        self.assertIsNotNone(win._copied_metadata)
+        win.selected_repo_asset_path = "audio/snare"
+        win._refresh_component_triad()
+        win._action_paste_metadata(merge=False)
+        snap = load_component_snapshot(proj_root, win.active_component_path)
+        self.assertEqual(snap.repo_assets["audio/snare"].author, "Jane Doe")
+        self.assertEqual(snap.repo_assets["audio/snare"].url, "https://example.com/packs/bass-di")
+        self.assertEqual(snap.repo_assets["audio/snare"].license, "CC-BY-4.0")
+        self.assertEqual(snap.repo_assets["audio/snare"].custom, {"bpm": "120"})
+
+        # Cross-entity paste: Repo -> Published release
+        win.triad_tabs.setCurrentIndex(2)
+        win._action_paste_metadata(merge=False)
+        snap = load_component_snapshot(proj_root, win.active_component_path)
+        self.assertEqual(snap.published_deliverables["main"].versions[0].custom.get("bpm"), "120")
+
+        # Cross-entity paste: Working -> Repo preserves Repo author/url/license while copying tags/custom
+        win.triad_tabs.setCurrentIndex(0)
+        win._action_copy_metadata()
+        win.triad_tabs.setCurrentIndex(1)
+        win.selected_repo_asset_path = "audio/snare"
+        win._refresh_component_triad()
+        win._action_paste_metadata(merge=False)
+        snap = load_component_snapshot(proj_root, win.active_component_path)
+        self.assertEqual(snap.repo_assets["audio/snare"].author, "Jane Doe")
+        self.assertEqual(snap.repo_assets["audio/snare"].url, "https://example.com/packs/bass-di")
+        self.assertEqual(snap.repo_assets["audio/snare"].custom.get("mood"), "energetic")
+
+        # SmartIngestDialog URL, custom fields, and paste copied metadata
+        ing_paste = SmartIngestDialog(
+            win,
+            source_file=snare_wav,
+            suggested_asset_path="audio/clap",
+            copied_metadata={
+                "author": "Copied Artist",
+                "source": "Copied Pack",
+                "url": "https://example.com/clap",
+                "license": "CC0",
+                "tags": ["drums", "clap"],
+                "custom": {"kit": "808"},
+            },
+        )
+        ing_paste._apply_copied_metadata()
+        pvals = ing_paste.get_values()
+        self.assertEqual(pvals["url"], "https://example.com/clap")
+        self.assertEqual(pvals["author"], "Copied Artist")
+        self.assertEqual(pvals["custom"], {"kit": "808"})
+
+        # CreditsReportDialog includes URL column and Markdown link
+        rows2 = self.ws.generate_credits_report(proj_root)
+        cred_dlg2 = CreditsReportDialog(win, "album_ux", rows2)
+        self.assertEqual(cred_dlg2.table.columnCount(), 8)
+        self.assertIn("https://example.com/packs/bass-di", cred_dlg2.format_markdown())
+        win.close()
 
 
 if __name__ == "__main__":

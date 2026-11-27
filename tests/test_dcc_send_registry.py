@@ -245,7 +245,9 @@ class TestDCCSendRegistry(unittest.TestCase):
                 self.assertEqual(win.dcc_target_combo.itemText(0), "Auto (No Live DCC)")
                 self.assertFalse(win.dcc_mode_combo.isEnabled())
                 self.assertFalse(win.dcc_send_btn.isEnabled())
-                self.assertEqual(win.dcc_export_btn.text(), "← Export (REAPER)…")
+                self.assertEqual(win.dcc_export_btn.text(), "Export (REAPER)…")
+                self.assertFalse(win.dcc_export_btn.icon().isNull())
+                self.assertFalse(win.dcc_send_btn.icon().isNull())
 
                 win.triad_tabs.setCurrentIndex(1)
                 self.assertFalse(win.dcc_send_btn.isEnabled())
@@ -269,8 +271,10 @@ class TestDCCSendRegistry(unittest.TestCase):
                 self.assertIn("Auto → REAPER ●", win.dcc_target_combo.itemText(0))
                 self.assertTrue(win.dcc_mode_combo.isEnabled())
                 self.assertTrue(win.dcc_send_btn.isEnabled())
-                self.assertEqual(win.dcc_send_btn.text(), "→ Send 2 Files to REAPER")
-                self.assertEqual(win.dcc_export_btn.text(), "← Export (REAPER)…")
+                self.assertEqual(win.dcc_send_btn.text(), "Send 2 Files to REAPER")
+                self.assertFalse(win.dcc_send_btn.icon().isNull())
+                self.assertEqual(win.dcc_export_btn.text(), "Export (REAPER)…")
+                self.assertFalse(win.dcc_export_btn.icon().isNull())
 
                 # Switch mode combo to 'At Cursor' -> persists and updates Send
                 cursor_idx = win.dcc_mode_combo.findData("cursor_track")
@@ -291,7 +295,8 @@ class TestDCCSendRegistry(unittest.TestCase):
                 upd_idx = win.dcc_mode_combo.findData("update_existing")
                 self.assertGreaterEqual(upd_idx, 0)
                 win.dcc_mode_combo.setCurrentIndex(upd_idx)
-                self.assertEqual(win.dcc_send_btn.text(), "↻ Update in REAPER")
+                self.assertEqual(win.dcc_send_btn.text(), "Update in REAPER")
+                self.assertFalse(win.dcc_send_btn.icon().isNull())
                 self.assertEqual(win.hub.get_preferred_dcc_mode("reaper"), "cursor_track")
 
             # 2 live (REAPER + Resolve) and pinning Resolve
@@ -306,8 +311,9 @@ class TestDCCSendRegistry(unittest.TestCase):
                 self.assertGreaterEqual(res_idx, 0)
                 win.dcc_target_combo.setCurrentIndex(res_idx)
                 self.assertEqual(win.hub.config.pinned_dcc_target, "resolve")
-                self.assertEqual(win.dcc_send_btn.text(), "→ Send 2 Files to Resolve")
-                self.assertEqual(win.dcc_export_btn.text(), "← Export (Resolve)…")
+                self.assertEqual(win.dcc_send_btn.text(), "Send 2 Files to Resolve")
+                self.assertFalse(win.dcc_send_btn.icon().isNull())
+                self.assertEqual(win.dcc_export_btn.text(), "Export (Resolve)…")
 
                 with patch.object(win, "_action_export_from_resolve") as mock_export_resolve:
                     win.dcc_export_btn.click()

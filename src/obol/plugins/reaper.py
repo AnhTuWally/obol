@@ -234,7 +234,6 @@ class ReaperPlugin:
         return [
             PluginAction("launch", "Launch .rpp in REAPER", "Open selected working .rpp file in REAPER"),
             PluginAction("open_in_reaper_tab", "Open in New REAPER Tab", "Open .rpp in a new REAPER project tab via bridge"),
-            PluginAction("version_up_launch", "vUp + Launch", "Create next working version and launch"),
             PluginAction(
                 "increment_save_reaper",
                 "Increment Save in REAPER",

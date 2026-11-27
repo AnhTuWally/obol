@@ -39,6 +39,13 @@ from obol.core.hub import ObolHub
 from obol.core.models import VersionBundle
 from obol.core.storage import discover_project_components, load_component_snapshot
 from obol.core.workspace import ObolWorkspace
+from obol.gui.components import (
+    DCCAssetBrowserWidget,
+    DialogFooter,
+    confirm_destructive_action,
+    repolish,
+    run_with_busy_state,
+)
 from obol.gui.theme import apply_studio_dark_theme
 from obol.plugins.resolve_bridge import (
     ResolveBridgeClient,
@@ -48,12 +55,7 @@ from obol.plugins.resolve_bridge import (
 from obol.plugins.resolve_installer import ResolveInstaller
 
 
-def _repolish(widget: QWidget) -> None:
-    st = widget.style()
-    if st is not None:
-        st.unpolish(widget)
-        st.polish(widget)
-    widget.update()
+_repolish = repolish
 
 
 def _write_result_json(result_file: Path, payload: dict[str, Any]) -> None:
@@ -109,37 +111,15 @@ class ResolveImportDialog(QDialog):
         tab_load = QWidget()
         tl_layout = QVBoxLayout(tab_load)
 
-        filter_row = QHBoxLayout()
-        filter_row.addWidget(QLabel("Project:"))
-        self.project_combo = QComboBox()
+        self.browser = DCCAssetBrowserWidget(self, search_placeholder="Filter media, stems, renders…")
+        self.project_combo = self.browser.project_combo
         for p in self.hub.list_projects():
             self.project_combo.addItem(p.name, p.local_path)
-        filter_row.addWidget(self.project_combo)
-
-        filter_row.addWidget(QLabel("Scope:"))
-        self.scope_combo = QComboBox()
-        self.scope_combo.addItem("All Repo & Published", "all")
-        self.scope_combo.addItem("Component Repo Only", "repo")
-        self.scope_combo.addItem("Published Deliverables Only", "published")
-        filter_row.addWidget(self.scope_combo)
-
-        self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Filter media, stems, renders…")
-        self.search_edit.setClearButtonEnabled(True)
-        filter_row.addWidget(self.search_edit, 1)
-        tl_layout.addLayout(filter_row)
-
-        self.asset_tree = QTreeWidget()
-        self.asset_tree.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        self.asset_tree.setAlternatingRowColors(True)
+        self.scope_combo = self.browser.scope_combo
+        self.search_edit = self.browser.search_edit
+        self.asset_tree = self.browser.asset_tree
         self.asset_tree.setHeaderLabels(["File / Asset", "Kind", "Component", "Version", "Note"])
-        self.asset_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.asset_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.asset_tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.asset_tree.header().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.asset_tree.header().setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
-        self.asset_tree.setColumnWidth(4, 180)
-        tl_layout.addWidget(self.asset_tree, 1)
+        tl_layout.addWidget(self.browser, 1)
 
         opts_form = QFormLayout()
         self.bin_combo = QComboBox()
@@ -560,7 +540,7 @@ class ResolveExportPublishDialog(QDialog):
         ps_info = QLabel(
             "Pre-creates <code>published/&lt;deliverable&gt;/vNNN/</code>, switches Resolve to the "
             "<b>Deliver</b> page, and sets <code>TargetDir</code> + <code>CustomName</code> so you can "
-            "fine-tune codecs before rendering. Use <b>2. Sync Exports</b> in Obol afterward."
+            "fine-tune codecs before rendering. Use <b>Manual Export → 2. Sync Rendered Exports</b> in Obol afterward."
         )
         ps_info.setWordWrap(True)
         ps_layout.addWidget(ps_info)
@@ -609,16 +589,12 @@ class ResolveExportPublishDialog(QDialog):
         self.drp_snapshot_chk = QCheckBox("Also export .drp working snapshot into working/vNNN/")
         layout.addWidget(self.drp_snapshot_chk)
 
-        btns = QHBoxLayout()
-        btns.addStretch()
         self.export_btn = QPushButton("Export && Publish")
         self.export_btn.setObjectName("PrimaryButton")
         self.export_btn.clicked.connect(self._on_execute)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
-        btns.addWidget(self.export_btn)
-        btns.addWidget(cancel_btn)
-        layout.addLayout(btns)
+        layout.addWidget(DialogFooter(self, cancel_button=cancel_btn, primary_button=self.export_btn))
 
         self.method_combo.currentIndexChanged.connect(self.method_stack.setCurrentIndex)
         self.project_combo.currentIndexChanged.connect(self._reload_components)
@@ -836,7 +812,8 @@ class ResolveExportPublishDialog(QDialog):
             )
             return
 
-        try:
+        def _work() -> Optional[VersionBundle]:
+            cur_work_ver = work_ver
             if want_drp:
                 tmp_drp = self.bridge.tmp_dir / f"{comp.split('/')[-1]}_snapshot.drp"
                 self.bridge.export_project_drp(tmp_drp)
@@ -848,31 +825,24 @@ class ResolveExportPublishDialog(QDialog):
                         comment=f"Resolve .drp snapshot before {deliv_path}/v{ver_num:03d}",
                         copy_mode="move",
                     )
-                    work_ver = w_bundle.version
+                    cur_work_ver = w_bundle.version
 
             self.bridge.send_command(action, params, timeout_s=1800.0)
             if not need_sync:
-                QMessageBox.information(
-                    self,
-                    "Deliver Page Staged",
-                    f"Resolve Deliver page pointed to:\n{export_dir}\n\nClick '2. Sync Exports' in Obol after rendering.",
-                )
-                self.accept()
-                return
+                return None
 
             bundle = self.workspace.sync_published_folder(
                 project_root=proot,
                 component_path=comp,
                 deliverable_name=deliv_path,
                 version=ver_num,
-                source_working_version=work_ver,
+                source_working_version=cur_work_ver,
                 comment=comment,
             )
             if bundle is None:
                 if export_dir.is_dir() and not any(export_dir.iterdir()):
                     export_dir.rmdir()
-                QMessageBox.warning(self, "Export Empty", "No rendered files were produced in the export folder.")
-                return
+                raise RuntimeError("No rendered files were produced in the export folder.")
             if tags:
                 self.workspace.update_published_metadata(
                     project_root=proot,
@@ -881,15 +851,37 @@ class ResolveExportPublishDialog(QDialog):
                     version=bundle.version,
                     tags=list(dict.fromkeys(list(bundle.tags) + tags)),
                 )
+            return bundle
+
+        def _on_success(bundle: Optional[VersionBundle]) -> None:
+            if not need_sync:
+                QMessageBox.information(
+                    self,
+                    "Deliver Page Staged",
+                    f"Resolve Deliver page pointed to:\n{export_dir}\n\nClick 'Manual Export → 2. Sync Rendered Exports' in Obol after rendering.",
+                )
+                self.accept()
+                return
             self.published_bundle = bundle
+            assert bundle is not None
             QMessageBox.information(
                 self,
                 "Published Deliverable",
                 f"Published {comp}/published/{deliv_path}/{bundle.version_label} ({len(bundle.files)} file(s))!",
             )
             self.accept()
-        except Exception as exc:
-            QMessageBox.warning(self, "Export & Publish Failed", str(exc))
+
+        def _on_error(exc: Exception) -> None:
+            title = "Export Empty" if "No rendered files" in str(exc) else "Export & Publish Failed"
+            QMessageBox.warning(self, title, str(exc))
+
+        run_with_busy_state(
+            self,
+            _work,
+            on_success=_on_success,
+            on_error=_on_error,
+            disable_widgets=[self.export_btn],
+        )
 
 
 class ResolveIntegrationDialog(QDialog):
@@ -1030,7 +1022,14 @@ class ResolveIntegrationDialog(QDialog):
         except Exception as exc:
             QMessageBox.warning(self, "Install Failed", str(exc))
 
-    def _on_uninstall(self) -> None:
+    def _on_uninstall(self, confirm: bool = True) -> None:
+        if confirm and not confirm_destructive_action(
+            self,
+            "Uninstall Resolve Integration",
+            "Remove Obol DaVinci Resolve scripts?",
+            confirm_label="Uninstall",
+        ):
+            return
         sdir_txt = self.scripts_dir_edit.text().strip()
         sdir = Path(sdir_txt) if sdir_txt else None
         self.installer.uninstall(scripts_dir=sdir, allow_studio_api=self.bridge.allow_studio_api)
@@ -1089,7 +1088,9 @@ def launch_resolve_dialog(
             default_component=component,
         )
     else:
-        dlg = ResolveIntegrationDialog(None, hub, bridge)
+        from obol.gui.integrations_dialog import IntegrationsManagerDialog
+
+        dlg = IntegrationsManagerDialog(None, hub, initial_dcc="resolve")
 
     dlg.exec()
     return 0

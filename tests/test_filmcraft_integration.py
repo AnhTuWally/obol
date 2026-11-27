@@ -419,7 +419,7 @@ class TestFilmCraftIntegration(unittest.TestCase):
         self.ws.create_component(proj, "edit", task_template="filmcraft_video")
 
         win = ObolMainWindow(hub=self.hub, initial_project="fc_ui", initial_component="edit")
-        self.assertFalse(win.filmcraft_export_btn.isHidden())
+        self.assertIn("FilmCraft", win.dcc_export_btn.text())
         self.assertFalse(win.collect_media_btn.isHidden())
         self.assertIn(".fcproj", win.collect_media_btn.text())
         win.close()

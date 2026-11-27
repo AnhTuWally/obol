@@ -485,6 +485,7 @@ function M.exec_save_project_as(params)
     switched_in_place = switched_in_place,
     reloaded = reloaded,
     dirty = (reaper.IsProjectDirty(0) == 1),
+    reaper_version = reaper.GetAppVersion(),
   }
 end
 

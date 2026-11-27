@@ -206,6 +206,7 @@ class GlobalConfig:
     last_active_project: str = ""
     author_name: str = ""
     fast_drop: bool = False
+    auto_save_metadata: bool = True
     pinned_dcc_target: str = ""
     last_used_dcc_target: str = ""
     dcc_default_modes: dict[str, str] = field(default_factory=dict)
@@ -218,6 +219,7 @@ class GlobalConfig:
             "last_active_project": self.last_active_project,
             "author_name": self.author_name,
             "fast_drop": self.fast_drop,
+            "auto_save_metadata": self.auto_save_metadata,
             "pinned_dcc_target": self.pinned_dcc_target,
             "last_used_dcc_target": self.last_used_dcc_target,
             "dcc_default_modes": self.dcc_default_modes,
@@ -245,6 +247,7 @@ class GlobalConfig:
             last_active_project=str(data.get("last_active_project", "")),
             author_name=str(data.get("author_name", "")),
             fast_drop=bool(data.get("fast_drop", False)),
+            auto_save_metadata=bool(data.get("auto_save_metadata", True)),
             pinned_dcc_target=str(data.get("pinned_dcc_target", "")),
             last_used_dcc_target=str(data.get("last_used_dcc_target", "")),
             dcc_default_modes=dcc_default_modes,
@@ -380,6 +383,7 @@ class RepoAsset:
     category: str = ""
     author: str = ""
     source: str = ""
+    url: str = ""
     license: str = ""
     tags: list[str] = field(default_factory=list)
     custom: dict[str, Any] = field(default_factory=dict)
@@ -394,6 +398,7 @@ class RepoAsset:
             "category": self.category,
             "author": self.author,
             "source": self.source,
+            "url": self.url,
             "license": self.license,
             "tags": self.tags,
             "custom": self.custom,
@@ -413,6 +418,7 @@ class RepoAsset:
             category=str(data.get("category", "")),
             author=str(data.get("author", "")),
             source=str(data.get("source", "")),
+            url=str(data.get("url", "")),
             license=str(data.get("license", "")),
             tags=list(data.get("tags", [])),
             custom=dict(data.get("custom", {})),

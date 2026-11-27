@@ -7,45 +7,43 @@ This document describes the architecture of the PySide6 Desktop GUI (`src/obol/g
 ## 1. Desktop GUI Architecture (`src/obol/gui/`)
 
 ### A. Main Window Layout (`ObolMainWindow` in `src/obol/gui/app.py`)
-To keep day-to-day navigation effortless and clutter-free, the main window uses a **Streamlined Top Bar + Central Stack (Welcome Screen / 3-Pane Splitter) + Bottom Status Bar**:
+To keep day-to-day navigation effortless and clutter-free, the main window uses a **Minimalist Top Header Bar + Central Stack (Welcome Screen / 3-Pane Splitter) + Bottom Status Bar**:
 
 1. **Top Header Bar (`QFrame#TopBar`)**:
-   - **Left (Project Navigation)**: `project_combo` (searchable dropdown switcher), `+ New Project` (`Ctrl+N`), and `Projects & Vault...` (`ProjectAndVaultManagerDialog`).
+   - **Left (Project Navigation)**: Obol icon & wordmark, `project_combo` (searchable dropdown switcher), and `New Project` (`Ctrl+N`).
    - **Right (Workflow & Studio Settings)**:
-     - `Fast Drop: OFF` / `⚡ Fast Drop: ON` toggle button (highlighted in amber when `ON`). When `OFF`, dropping or ingesting opens the corresponding staging/naming dialog (`IngestWorkingDialog`, `SmartIngestDialog`, or `PublishDeliverableDialog`). When `ON`, dropped files ingest/publish immediately with auto-routed defaults.
-     - `↻ Refresh` (`F5`): Runs `Reconciler.reconcile_project()` to pick up external disk changes and refreshes the UI.
+     - `Fast Drop: OFF` / `Fast Drop: ON` toggle button (highlighted in amber when `ON`). When `OFF`, dropping or ingesting opens the corresponding staging/naming dialog (`IngestWorkingDialog`, `SmartIngestDialog`, or `PublishDeliverableDialog`). When `ON`, dropped files ingest/publish immediately with auto-routed defaults.
      - `Credits`: Opens `CreditsReportDialog`.
-     - `⚙ Settings ▾` menu: Consolidates `3-Tier Templates...`, `Software Profiles...`, `DCC Integrations...`, `Change Client Workspace Root...`, and `Open Global Hub Folder (~/.obol)`.
+     - `↻` Refresh (`F5`): Runs `Reconciler.reconcile_project()` to pick up external disk changes and refreshes the UI.
+     - `Settings` menu: Consolidates `Auto-Save Inspector Metadata` (ON by default), `Projects & Vault Manager...`, `3-Tier Templates...`, `Software Seed Templates...`, `Software Profiles...`, `DCC Integrations...`, `Change Client Workspace Root...`, and `Open Global Hub Folder (~/.obol)`.
 
 2. **Bottom Status Bar (`QFrame#StatusBar`)**:
-   - Clickable path breadcrumb button (opens active folder in OS Explorer), transient status confirmation messages (`✓ Saved metadata...`), `Root: <folder>` quick selector, clickable `DCC` summary pill (`DCC: Setup…` / `DCC: <N> Ready` / `DCC: ... Live ●`) + live connected pills, and clickable `Vault` status pill (`Standalone Local` / `Vault Online` / `Vault Offline`).
+   - Clickable `Root: <folder>` quick selector, transient status confirmation messages (`✓ Saved metadata...`), single unified clickable `DCC` pill (with live per-DCC breakdown tooltip; opens `IntegrationsManagerDialog`), and clickable `Vault` status pill (`Standalone Local` / `Vault Online` / `Vault Offline`; opens `ProjectAndVaultManagerDialog`).
 
 3. **Zero-Project Welcome Screen (`central_stack` page 0)**:
    - When no project is loaded, displays an onboarding card explaining the Triad workflow with `+ Create New Project`, `Register Existing Project Folder...`, and `Projects & Vault...` buttons.
 
 4. **Pane 1 (Left) — Hierarchical Component Tree & Search (`self.component_tree`)**:
-   - Renders multi-level component paths (`song_1/arrangement`, `song_1/mixing`) as collapsible group folders (`song_1/`) alongside their bound software key (`reaper`, `krita`, `blender`).
-   - Includes a live `Filter components…` search bar and `+ Add` button (`AddComponentDialog` with template/software picker, `Ctrl+Shift+N`), plus right-click context menu (`+ Add Component...`, `Open Folder in Explorer`, `Copy Folder Path`, `Capture as Component Template...`, `Delete Component...`).
+   - Renders multi-level component paths (`song_1/arrangement`, `song_1/mixing`) as collapsible group folders (`song_1/`) alongside their muted monospace bound software key (`reaper`, `krita`, `blender`).
+   - Includes a live `Filter components…` search bar (`Ctrl+F`) and `+` button (`AddComponentDialog`, `Ctrl+Shift+N`), plus right-click context menu. Clicking a group folder displays a clean **Group Overview** card in Pane 2 listing its child components.
 
-5. **Pane 2 (Center) — Tabbed Triad Workspace with OS Drag-and-Drop (`self.triad_tabs`)**:
-   - Powered by `DropTreeWidget` (`src/obol/gui/drop_widgets.py`) with `dragActive` drop-zone highlighting, painted empty-state drop guidance, and tab-bar hover auto-switching (~350 ms hover switches tabs mid-drag):
-   - **Tab 0 (`Working`)**: Multi-column table (`Version` | `Primary File` | `Created` | `Note`) showing `★` on latest and `🔒` on read-only locked versions. Double-click launches that exact working version; right-click offers `Open`, `Version Up from vNNN...`, `Publish from vNNN...`, `Save as Working Seed Template...`, `Open Folder`, `Copy Path`, and `Delete`.
-   - **Tab 1 (`Repo Assets`)**: Horizontal `QSplitter` Master–Detail layout:
-     - *Left (`self.repo_asset_tree`)*: Collapsible category folders (`audio/` → `lead_vocal`) showing `Ver` and `Used` counts, with `+ Slot` and `+ Ingest...`. Dropping onto empty space or a category folder creates a new named Repo Asset; dropping onto an existing asset adds `v(N+1)`.
-     - *Right (`self.repo_version_list`)*: Multi-column version list (`Version` | `File` | `Size` | `Note`) supporting multi-selection, drag-out, double-click to open, and fast local right-click actions (`Open`, `+ Ingest New Version...`, `Open Version Folder`, `Copy File Path`, `Delete`).
-   - **Tab 2 (`Published`)**: Horizontal `QSplitter` Master–Detail layout:
-     - *Left (`self.published_deliverable_tree`)*: Named Deliverable streams (`main`, `stems`, `midi_pack`, etc.) with `+ Slot` and `+ Publish...` (`Ctrl+P`).
-     - *Right (`self.published_version_tree`)*: Expandable version tree (`Version / File` | `Types` | `Source / Size` | `Note`) showing format badges (`WAV, MID, MP3`), working lineage (`← working/v002`), child files (double-click to open), `1. Export Folder` / `2. Sync Exports` buttons for direct multi-format DCC exports, multi-selection, and fast local right-click actions (`Open File`, `+ Attach More Files...`, `Open Release Folder`, `Copy Path`, `Delete`).
+5. **Pane 2 (Center) — Component Context Header + Tabbed Triad Workspace (`self.triad_tabs`)**:
+   - **Component Context Header**: Clickable component breadcrumb (`song_1 / arrangement` → opens Explorer), inline `App:` Bound Software selector with executable status badge, and `···` overflow menu (`Open Component Folder`, `Copy Component Path`, `Capture as Component Template...`, `Delete Component...`).
+   - Powered by `DropTreeWidget` (`src/obol/gui/drop_widgets.py`) with `dragActive` drop-zone highlighting, painted empty-state drop cards, and tab-bar hover auto-switching (~350 ms hover switches tabs mid-drag):
+   - **Tab 0 (`Working`)**: Searchable (`Filter working versions…`) multi-column table (`Version` | `Primary File` | `Created` | `Note`) with instant `Version Up` (`Ctrl+U`, no modal prompt) and `Ingest File…`. Double-click launches that exact working version.
+   - **Tab 1 (`Repo Assets`)**: Horizontal `QSplitter` Master–Detail layout with inline `Filter assets…` search bar, `+ Slot`, `Ingest…`, and multi-selection version list supporting drag-out and double-click to open.
+   - **Tab 2 (`Published`)**: Horizontal `QSplitter` Master–Detail layout with inline `Filter deliverables…` search bar, `+ Slot`, `Publish…` (`Ctrl+P`), and `Manual Export` menu (`1. Prepare & Open Export Folder…` / `2. Sync Rendered Exports`) alongside the expandable release tree.
    - **Dedicated DCC Exchange Bar (`QFrame#DccExchangeBar`)**: Docked cleanly at the bottom of Pane 2 below the Triad tabs with a **Target DCC** dropdown (`Auto → <Live DCC> ●` or pinned DCC), **Send Mode** dropdown (remembers your preferred insert mode per DCC), **`→ Send to <DCC>`** button (`Ctrl+D`), **`← Export (<DCC>)…`** button, and **`↻`** live status refresh button.
 
-6. **Pane 3 (Right) — Context-Aware Inspector & Actions**:
-   - Automatically adapts to the active Triad tab (`Working Version`, `Repo Asset`, or `Published`):
-     - **Component Settings**: `Bound Software` selector (updates `component_tree` immediately and shows executable status hint).
-     - **Selection Inspector**: Shows lineage/usage (`Used in working: v001, v002` or `Source: working/v002`), shows `Author` / `Source` / `License` fields on the Repo Assets tab, and edits `Tags` & `Note` across all 3 tabs (`Save Metadata (Ctrl+S)`).
-     - **Contextual Actions**: `Open <Selected>` (launches the selected Working version, Repo file, or Published file), `Version Up + Open`, `Publish from Working...`, `Scan & Collect External .rpp Media` (for Reaper), `Open Folder`, `Copy Path`, granular Vault `Check Out Item` / `Offload Item` (when `VaultStatus.ONLINE`), and `Delete Selected...`.
+6. **Pane 3 (Right) — Scrollable, Action-First, Context-Aware Inspector**:
+   - Wrapped in a frameless `QScrollArea` and strictly scoped to the active Triad tab (`Working Version`, `Repo Asset`, or `Published`):
+     - **Selection Summary & Context Badge**: Shows item name, lineage/usage/hash, and live metadata save state (`✓ Saved` / `● Unsaved`).
+     - **Action-First Controls**: Primary `Open <Selected>` button at the top, followed strictly by tab-relevant actions (`Version Up + Open`, `Increment Save`, `Publish from vNNN...`, `Scan & Collect`, `Update REAPER Media / MIDI...`, `Save as Seed Template...` on Working; `+ Ingest New Version…` on Repo; `+ Attach More Files…` on Published).
+     - **Metadata Form (Auto-Save by Default)**: Edits `Tags`, `Note`, and dynamic **Custom Fields** (key + value pairs with autocomplete) across all tabs, plus `Author` / `Source` / `URL` (with 1-click open) / `License` on Repo Assets. Includes **Copy & Paste Metadata** (`Ctrl+Shift+C` / `Ctrl+Shift+V` and context menus, including multi-select and category-wide paste on Repo Assets). Automatically saves on edit pause or `Enter` / focus-out when `Auto-Save Inspector Metadata` is enabled (or via `Save Metadata (Ctrl+S)` when disabled).
+     - **Utility & Danger Footer**: `Folder`, `Copy Path`, Vault `Check Out` / `Offload` (when `VaultStatus.ONLINE`), and `Delete`.
 
 7. **Keyboard Shortcuts**:
-   - `Ctrl+N` New Project • `Ctrl+Shift+N` Add Component • `Ctrl+U` Version Up • `Ctrl+I` Ingest into active tab • `Ctrl+P` Publish • `Ctrl+D` Send selected Repo/Published media via DCC Exchange Bar • `Ctrl+S` Save Inspector Metadata • `F5` Refresh & Reconcile • `Delete` Delete focused item.
+   - `Ctrl+N` New Project • `Ctrl+Shift+N` Add Component • `Ctrl+U` Instant Version Up • `Ctrl+Shift+S` REAPER Increment Save • `Ctrl+I` Ingest into active tab • `Ctrl+P` Publish • `Ctrl+D` Send selected Repo/Published media via DCC Exchange Bar • `Ctrl+S` Save Inspector Metadata • `Ctrl+Shift+C` / `Ctrl+Shift+V` Copy / Paste Metadata • `Ctrl+F` Focus active filter • `F5` Refresh & Reconcile • `Delete` Delete focused item.
 
 ---
 
@@ -119,7 +117,7 @@ obol work open <component_path> [-p <project>] [-v <version_num>]
 obol work scan <component_path> [-p <project>] [--collect]
 
 # Version-Controlled Repo Ingestion & Provenance Credits
-obol ingest <file_path> --task <component_path> [-p <project>] [--asset <subpath>] [--author "..."] [--source "..."] [--license "..."] [--tag <tag>] [-m "comment"] [--meta key=val]
+obol ingest <file_path> --task <component_path> [-p <project>] [--asset <subpath>] [--author "..."] [--source "..."] [--url "https://..."] [--license "..."] [--tag <tag>] [-m "comment"] [--meta key=val]
 obol credits [-p <project>]
 
 # Publishing Named Multi-File Deliverables

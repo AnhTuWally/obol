@@ -26,7 +26,8 @@ from obol.gui.reaper_dialogs import (
     ReaperIntegrationDialog,
     ReaperOpenDialog,
 )
-from obol.plugins.base import unlock_file_writable
+from obol.plugins.base import TaskContext, unlock_file_writable
+from obol.plugins.reaper import ReaperPlugin
 from obol.plugins.reaper_bridge import ReaperBridgeClient, parse_reaper_render_presets
 from obol.plugins.reaper_installer import ReaperInstaller
 from obol.plugins.reaper_scripts import (
@@ -312,6 +313,7 @@ class TestReaperIntegration(unittest.TestCase):
 
         d_open = ReaperOpenDialog(None, self.hub, self.ws, self.bridge, active_rpp=str(rpp_v1))
         self.assertGreater(d_open.ver_tree.topLevelItemCount(), 0)
+        self.assertFalse(hasattr(d_open, "vup_open_btn"))
         d_open.close()
 
         d_imp = ReaperImportDialog(None, self.hub, self.ws, self.bridge, active_rpp=str(rpp_v1))
@@ -330,6 +332,7 @@ class TestReaperIntegration(unittest.TestCase):
         self.assertEqual(win.active_project_name, "gui_reaper")
         self.assertEqual(win.active_component_path, "audio")
         self.assertIn("REAPER:", win.reaper_status_pill.text())
+        self.assertFalse(hasattr(win, "vup_launch_btn"))
 
         # Verify OS drag-out MIME data on working_list & published_version_tree
         w_item = win.working_list.topLevelItem(0)
@@ -652,8 +655,19 @@ class TestReaperIntegration(unittest.TestCase):
         self.assertIn("Main_SaveProjectEx(0, pdata.primary_file, 8)", inc_lua)
         self.assertIn("Main_SaveProjectEx(0, pdata.primary_file, 8)", vup_lua)
         self.assertIn("Main_openProject", inc_lua)
+        self.assertIn("reaper_version = reaper.GetAppVersion()", lib_lua)
         toolbar = render_obol_toolbar_menu({fname: f"CMD_{i}" for i, (fname, _, _) in enumerate(OBOL_ACTION_SPECS)})
         self.assertIn("Obol: IncSave", toolbar)
+
+        reaper_actions = ReaperPlugin().get_inspector_actions(
+            TaskContext(
+                project_root=self.root,
+                component_path="audio",
+                component_dir=self.root / "audio",
+                software_profile=self.hub.get_software_profile("reaper"),
+            )
+        )
+        self.assertNotIn("version_up_launch", [a.id for a in reaper_actions])
 
         proj = self.ws.init_project("inc_save_proj", self.root / "inc_save_proj")
         rpp_v1 = proj / "audio" / "working" / "v001" / "audio_v001.rpp"
@@ -685,7 +699,12 @@ class TestReaperIntegration(unittest.TestCase):
         proj2 = self.ws.init_project("inc_live_proj", self.root / "inc_live_proj")
         live_v1 = proj2 / "audio" / "working" / "v001" / "audio_v001.rpp"
         live_v1_orig = live_v1.read_text(encoding="utf-8")
-        session_state = {"active_rpp": str(live_v1)}
+        session_state = {
+            "active_rpp": str(live_v1),
+            "reaper_version": "7.34/win64",
+            "switched_in_place": True,
+            "reloaded": False,
+        }
         seen_actions: list[tuple[str, dict]] = []
 
         def _write_state() -> None:
@@ -693,7 +712,7 @@ class TestReaperIntegration(unittest.TestCase):
                 json.dumps({
                     "connected": True,
                     "heartbeat": time.time(),
-                    "reaper_version": "7.34/win64",
+                    "reaper_version": session_state["reaper_version"],
                     "active_rpp": session_state["active_rpp"],
                     "dirty": False,
                     "selected_tracks": 1,
@@ -725,9 +744,10 @@ class TestReaperIntegration(unittest.TestCase):
                             "saved": True,
                             "path": str(out_p),
                             "active_rpp": str(out_p),
-                            "switched_in_place": True,
-                            "reloaded": False,
+                            "switched_in_place": session_state["switched_in_place"],
+                            "reloaded": session_state["reloaded"],
                             "dirty": False,
+                            "reaper_version": session_state["reaper_version"],
                         }
                     else:
                         res = {"ok": True}
@@ -764,28 +784,44 @@ class TestReaperIntegration(unittest.TestCase):
             self.assertEqual(Path(session_state["active_rpp"]).resolve(), live_v3.resolve())
             self.assertTrue(seen_actions[-1][1].get("ensure_open"))
             self.assertNotIn("open_project", [a for a, _ in seen_actions])
+
+            # 3b. Simulated REAPER 7.28 reload fallback reports REAPER version & 7.34+ upgrade hint
+            session_state["reaper_version"] = "7.28/x64"
+            session_state["switched_in_place"] = False
+            session_state["reloaded"] = True
+            _write_state()
+            win_fallback = ObolMainWindow(hub=self.hub, initial_project="inc_live_proj", initial_component="audio")
+            bundle_v4 = win_fallback._action_reaper_increment_save(silent=True)
+            self.assertIsNotNone(bundle_v4)
+            assert bundle_v4 is not None
+            self.assertEqual(bundle_v4.version, 4)
+            status_msg = win_fallback.status_feedback_label.text()
+            self.assertIn("7.28/x64", status_msg)
+            self.assertIn("7.34+", status_msg)
+            win_fallback.close()
         finally:
             stop_evt.set()
             t.join(timeout=2.0)
 
-        # 4. CLI prepare-working + file write + register-working -> v004
+        # 4. CLI prepare-working + file write + register-working -> v005
+        live_v4 = proj2 / "audio" / "working" / "v004" / "audio_v004.rpp"
         self.assertEqual(
-            run_cli(["reaper", "prepare-working", "--rpp", str(live_v3), "--json"], hub=self.hub),
+            run_cli(["reaper", "prepare-working", "--rpp", str(live_v4), "--json"], hub=self.hub),
             0,
         )
-        live_v4 = proj2 / "audio" / "working" / "v004" / "audio_v004.rpp"
-        live_v4.write_text(live_v1_orig, encoding="utf-8")
+        live_v5 = proj2 / "audio" / "working" / "v005" / "audio_v005.rpp"
+        live_v5.write_text(live_v1_orig, encoding="utf-8")
         self.assertEqual(
             run_cli(
                 [
                     "reaper",
                     "register-working",
                     "--rpp",
-                    str(live_v4),
+                    str(live_v5),
                     "--parent-version",
-                    "3",
+                    "4",
                     "-m",
-                    "Registered v4",
+                    "Registered v5",
                     "--json",
                 ],
                 hub=self.hub,
@@ -796,7 +832,7 @@ class TestReaperIntegration(unittest.TestCase):
         from obol.core.storage import load_component_snapshot
 
         snap_loaded = load_component_snapshot(proj2, "audio")
-        self.assertEqual([w.version for w in snap_loaded.working_versions], [1, 2, 3, 4])
+        self.assertEqual([w.version for w in snap_loaded.working_versions], [1, 2, 3, 4, 5])
         del snap
 
 

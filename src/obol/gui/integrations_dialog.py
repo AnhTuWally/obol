@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtGui import QColor, QFont, QIcon
 from PySide6.QtWidgets import (
     QApplication,
@@ -21,7 +20,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
-    QMessageBox,
     QPushButton,
     QSplitter,
     QTableWidget,
@@ -34,39 +32,41 @@ from PySide6.QtWidgets import (
 )
 
 from obol.core.hub import ObolHub
+from obol.gui.components import (
+    DialogFooter,
+    InlineStatusBanner,
+    confirm_destructive_action,
+    open_folder_in_os,
+    repolish,
+)
+from obol.gui.icons import get_icon
 from obol.gui.theme import apply_studio_dark_theme
+from obol.gui.tokens import (
+    ACCENT_LIGHT,
+    ERROR,
+    ICON_SM,
+    INFO,
+    SUCCESS,
+    TEXT_DISABLED,
+    TEXT_SECONDARY,
+    WARNING,
+)
 from obol.plugins.integrations import DCCIntegrationManager, DCCIntegrationReport
 from obol.plugins.resolve_bridge import ResolveBridgeClient
 
-
-def _repolish(widget: QWidget) -> None:
-    st = widget.style()
-    if st is not None:
-        st.unpolish(widget)
-        st.polish(widget)
-    widget.update()
-
-
-def _open_folder_in_os(folder: Path) -> None:
-    if not folder.exists():
-        return
-    if sys.platform == "win32" and hasattr(os, "startfile"):
-        os.startfile(str(folder))
-
-
 _STATE_DISPLAY: dict[str, tuple[str, str, str]] = {
-    "connected": ("Live ●", "#4ade80", "StatusPillOnline"),
-    "installed": ("Installed ✓", "#93c5fd", "StatusPillOnline"),
-    "needs_update": ("Update Needed ⚠", "#fbbf24", "StatusPillOffline"),
-    "not_installed": ("Detected", "#d4d4d8", "StatusPillLocal"),
-    "not_detected": ("Not Found", "#71717a", "StatusPillLocal"),
+    "connected": ("Live ●", SUCCESS, "StatusPillOnline"),
+    "installed": ("Installed ✓", ACCENT_LIGHT, "StatusPillOnline"),
+    "needs_update": ("Update Needed ⚠", WARNING, "StatusPillOffline"),
+    "not_installed": ("Detected", TEXT_SECONDARY, "StatusPillLocal"),
+    "not_detected": ("Not Found", TEXT_DISABLED, "StatusPillLocal"),
 }
 
 _CHECK_BADGES: dict[str, tuple[str, str]] = {
-    "ok": ("✓", "#4ade80"),
-    "warn": ("⚠", "#fbbf24"),
-    "missing": ("✗", "#f87171"),
-    "info": ("ℹ", "#93c5fd"),
+    "ok": ("✓", SUCCESS),
+    "warn": ("⚠", WARNING),
+    "missing": ("✗", ERROR),
+    "info": ("ℹ", INFO),
 }
 
 
@@ -106,9 +106,11 @@ class IntegrationsManagerDialog(QDialog):
         self.summary_label = QLabel("")
         self.summary_label.setObjectName("MutedText")
         self.install_all_btn = QPushButton("Install / Update All Detected")
-        self.install_all_btn.setObjectName("PrimaryButton")
+        self.install_all_btn.setObjectName("SubtleToolButton")
         self.install_all_btn.clicked.connect(self._on_install_all)
-        self.rescan_btn = QPushButton("↻ Re-Scan")
+        self.rescan_btn = QPushButton("Re-Scan")
+        self.rescan_btn.setIcon(get_icon("refresh", TEXT_SECONDARY, ICON_SM))
+        self.rescan_btn.setIconSize(QSize(ICON_SM, ICON_SM))
         self.rescan_btn.clicked.connect(self._on_rescan)
         top_layout.addWidget(hdr_title)
         top_layout.addSpacing(8)
@@ -188,9 +190,7 @@ class IntegrationsManagerDialog(QDialog):
         right_layout.addLayout(act_row)
 
         # Inline Feedback Banner
-        self.feedback_label = QLabel("")
-        self.feedback_label.setWordWrap(True)
-        self.feedback_label.hide()
+        self.feedback_label = InlineStatusBanner(self)
         right_layout.addWidget(self.feedback_label)
 
         # Detail Tabs
@@ -216,7 +216,7 @@ class IntegrationsManagerDialog(QDialog):
         tdir_row = QHBoxLayout()
         self.target_dir_edit = QLineEdit()
         self.target_dir_edit.editingFinished.connect(self._on_target_dir_edited)
-        tdir_browse = QPushButton("Browse...")
+        tdir_browse = QPushButton("Browse…")
         tdir_browse.clicked.connect(self._browse_target_dir)
         tdir_auto = QPushButton("Auto-Detect")
         tdir_auto.setObjectName("SubtleToolButton")
@@ -228,7 +228,7 @@ class IntegrationsManagerDialog(QDialog):
 
         exe_row = QHBoxLayout()
         self.exe_edit = QLineEdit()
-        exe_browse = QPushButton("Browse...")
+        exe_browse = QPushButton("Browse…")
         exe_browse.clicked.connect(self._browse_exe)
         exe_auto = QPushButton("Auto-Detect")
         exe_auto.setObjectName("SubtleToolButton")
@@ -306,21 +306,14 @@ class IntegrationsManagerDialog(QDialog):
         splitter.setSizes([240, 680])
         root.addWidget(splitter, 1)
 
-        bottom = QHBoxLayout()
-        bottom.addStretch()
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
-        bottom.addWidget(close_btn)
-        root.addLayout(bottom)
+        root.addWidget(DialogFooter(self, cancel_button=close_btn))
 
         self._refresh_reports(select_key=self._current_key)
 
     def set_feedback(self, message: str, level: str = "ok") -> None:
-        colors = {"ok": "#4ade80", "warn": "#fbbf24", "error": "#f87171", "info": "#93c5fd"}
-        color = colors.get(level, "#d4d4d8")
-        self.feedback_label.setStyleSheet(f"color: {color}; font-weight: 600;")
-        self.feedback_label.setText(message)
-        self.feedback_label.show()
+        self.feedback_label.set_feedback(message, level)
 
     def _refresh_reports(self, select_key: Optional[str] = None) -> None:
         reports = self.manager.list_reports(target_dir_overrides=self._custom_target_dirs)
@@ -371,7 +364,7 @@ class IntegrationsManagerDialog(QDialog):
         badge_txt, _, pill_obj = _STATE_DISPLAY.get(rep.overall_state, ("Offline", "#a1a1aa", "StatusPillLocal"))
         self.detail_status_pill.setText(badge_txt)
         self.detail_status_pill.setObjectName(pill_obj)
-        _repolish(self.detail_status_pill)
+        repolish(self.detail_status_pill)
 
         if rep.needs_update:
             self.primary_install_btn.setText("Update / Repair Integration")
@@ -414,7 +407,7 @@ class IntegrationsManagerDialog(QDialog):
         for lbl, fpath in rep.quick_links:
             btn = QPushButton(lbl)
             btn.setObjectName("SubtleToolButton")
-            btn.clicked.connect(lambda _chk=False, p=fpath: _open_folder_in_os(Path(p)))
+            btn.clicked.connect(lambda _chk=False, p=fpath: open_folder_in_os(Path(p)))
             self.quick_links_layout.addWidget(btn)
         self.quick_links_layout.addStretch()
 
@@ -526,16 +519,13 @@ class IntegrationsManagerDialog(QDialog):
         rep = self._reports.get(self._current_key)
         if not rep:
             return
-        if confirm:
-            ans = QMessageBox.question(
-                self,
-                "Uninstall Integration",
-                f"Remove Obol scripts and hooks for {rep.display_name}?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
-            )
-            if ans != QMessageBox.StandardButton.Yes:
-                return
+        if confirm and not confirm_destructive_action(
+            self,
+            "Uninstall Integration",
+            f"Remove Obol scripts and hooks for {rep.display_name}?",
+            confirm_label="Uninstall",
+        ):
+            return
         self.manager.uninstall(self._current_key, target_dir=self._current_target_path())
         self._refresh_reports(select_key=self._current_key)
         self.set_feedback(f"Removed Obol integration for {rep.display_name}.", "info")

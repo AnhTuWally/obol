@@ -764,6 +764,7 @@ class ObolWorkspace:
         asset_path: Optional[str] = None,
         author: str = "",
         source_info: str = "",
+        url: str = "",
         license_info: str = "",
         tags: Optional[list[str]] = None,
         comment: str = "",
@@ -790,6 +791,7 @@ class ObolWorkspace:
                 category=category,
                 author=author or self.hub.config.author_name,
                 source=source_info or str(source_file.resolve()),
+                url=url,
                 license=license_info or "Unspecified",
                 tags=list(tags or []),
                 custom=dict(custom or {}),
@@ -801,6 +803,8 @@ class ObolWorkspace:
                 asset.author = author
             if source_info:
                 asset.source = source_info
+            if url:
+                asset.url = url
             if license_info:
                 asset.license = license_info
             if tags:
@@ -866,6 +870,7 @@ class ObolWorkspace:
                 "sha256": sha,
                 "author": asset.author,
                 "source": asset.source,
+                "url": asset.url,
                 "license": asset.license,
                 "tags": asset.tags,
                 "custom": asset.custom,
@@ -884,13 +889,15 @@ class ObolWorkspace:
         asset_path: str,
         author: Optional[str] = None,
         source_info: Optional[str] = None,
+        url: Optional[str] = None,
         license_info: Optional[str] = None,
         tags: Optional[list[str]] = None,
         comment: Optional[str] = None,
         version: Optional[int] = None,
         custom: Optional[dict[str, Any]] = None,
+        replace_custom: bool = False,
     ) -> RepoAsset:
-        """Updates provenance metadata (Author, Source, License, Tags, Custom) on a RepoAsset without mutating history."""
+        """Updates provenance metadata (Author, Source, URL, License, Tags, Custom) on a RepoAsset without mutating history."""
         norm_comp = normalize_rel_path(component_path)
         norm_asset = normalize_rel_path(asset_path)
         snapshot = load_component_snapshot(project_root, norm_comp)
@@ -905,6 +912,9 @@ class ObolWorkspace:
         if source_info is not None:
             asset.source = source_info
             payload["source"] = source_info
+        if url is not None:
+            asset.url = url
+            payload["url"] = url
         if license_info is not None:
             asset.license = license_info
             payload["license"] = license_info
@@ -912,7 +922,10 @@ class ObolWorkspace:
             asset.tags = list(tags)
             payload["tags"] = asset.tags
         if custom is not None:
-            asset.custom.update(custom)
+            if replace_custom:
+                asset.custom = dict(custom)
+            else:
+                asset.custom.update(custom)
             payload["custom"] = asset.custom
         if comment is not None and asset.versions:
             target_v = (
@@ -937,8 +950,10 @@ class ObolWorkspace:
         version: int,
         comment: Optional[str] = None,
         tags: Optional[list[str]] = None,
+        custom: Optional[dict[str, Any]] = None,
+        replace_custom: bool = False,
     ) -> VersionBundle:
-        """Updates comment and tags on a working/vNNN/ version without mutating file history."""
+        """Updates comment, tags, and custom fields on a working/vNNN/ version without mutating file history."""
         norm_comp = normalize_rel_path(component_path)
         snapshot = load_component_snapshot(project_root, norm_comp)
         bundle = next((v for v in snapshot.working_versions if v.version == version), None)
@@ -952,6 +967,12 @@ class ObolWorkspace:
         if tags is not None:
             bundle.tags = list(tags)
             payload["tags"] = bundle.tags
+        if custom is not None:
+            if replace_custom:
+                bundle.custom = dict(custom)
+            else:
+                bundle.custom.update(custom)
+            payload["custom"] = bundle.custom
 
         evt = append_event(project_root, norm_comp, "WORKING_METADATA_UPDATED", payload)
         snapshot.last_event_id = evt.id
@@ -967,8 +988,10 @@ class ObolWorkspace:
         version: int,
         comment: Optional[str] = None,
         tags: Optional[list[str]] = None,
+        custom: Optional[dict[str, Any]] = None,
+        replace_custom: bool = False,
     ) -> VersionBundle:
-        """Updates release note and tags on a published/ version without mutating deliverable files."""
+        """Updates release note, tags, and custom fields on a published/ version without mutating deliverable files."""
         norm_comp = normalize_rel_path(component_path)
         snapshot = load_component_snapshot(project_root, norm_comp)
         if deliverable_name == "__legacy__":
@@ -997,6 +1020,12 @@ class ObolWorkspace:
                 for t in bundle.tags:
                     if t not in deliverable.tags:
                         deliverable.tags.append(t)
+        if custom is not None:
+            if replace_custom:
+                bundle.custom = dict(custom)
+            else:
+                bundle.custom.update(custom)
+            payload["custom"] = bundle.custom
 
         evt = append_event(project_root, norm_comp, "PUBLISHED_METADATA_UPDATED", payload)
         snapshot.last_event_id = evt.id
@@ -1388,8 +1417,10 @@ class ObolWorkspace:
                     "latest_version": f"v{asset.latest_version:03d}",
                     "author": asset.author or "Unspecified",
                     "source": asset.source or "Unspecified",
+                    "url": asset.url,
                     "license": asset.license or "Unspecified",
                     "tags": ", ".join(asset.tags),
+                    "custom": dict(asset.custom),
                     "used_by_working": [f"v{v:03d}" for v in asset.used_by_working_versions],
                 })
         return rows

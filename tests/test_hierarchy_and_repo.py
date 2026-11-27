@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from obol.core.hub import ObolHub
-from obol.core.storage import discover_project_components
+from obol.core.storage import discover_project_components, load_component_snapshot
 from obol.core.workspace import ObolWorkspace
 
 
@@ -70,18 +70,40 @@ class TestHierarchyAndRepo(unittest.TestCase):
         self.assertEqual(asset.latest_version, 2)
         self.assertTrue((proj_root / "song_1/arrangement/repo/audio/lead_vocal/v002/lead_vocal_v002.wav").is_file())
 
-        # Update metadata and verify credits report
+        # Update metadata (including URL and custom fields with replace_custom) and verify credits + index
         self.ws.update_repo_metadata(
             project_root=proj_root,
             component_path="song_1/arrangement",
             asset_path="audio/lead_vocal",
+            url="https://freesound.org/people/sarah/sounds/12345/",
             license_info="Exclusive Commercial",
+            custom={"bpm": "124", "key": "Am", "temp_key": "remove_me"},
+            replace_custom=True,
         )
+        self.ws.update_repo_metadata(
+            project_root=proj_root,
+            component_path="song_1/arrangement",
+            asset_path="audio/lead_vocal",
+            custom={"bpm": "124", "key": "Am"},
+            replace_custom=True,
+        )
+        reloaded = load_component_snapshot(proj_root, "song_1/arrangement")
+        self.assertEqual(reloaded.repo_assets["audio/lead_vocal"].url, "https://freesound.org/people/sarah/sounds/12345/")
+        self.assertEqual(reloaded.repo_assets["audio/lead_vocal"].custom, {"bpm": "124", "key": "Am"})
+
         credits = self.ws.generate_credits_report(proj_root)
         self.assertEqual(len(credits), 1)
         self.assertEqual(credits[0]["author"], "Sarah Jenkins")
+        self.assertEqual(credits[0]["url"], "https://freesound.org/people/sarah/sounds/12345/")
         self.assertEqual(credits[0]["license"], "Exclusive Commercial")
         self.assertEqual(credits[0]["latest_version"], "v002")
+
+        from obol.core.index import ProjectIndex
+
+        idx = ProjectIndex(proj_root)
+        hits = idx.search_repo_assets(query="freesound.org")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["url"], "https://freesound.org/people/sarah/sounds/12345/")
 
 
 if __name__ == "__main__":

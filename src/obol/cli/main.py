@@ -117,7 +117,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_ing.add_argument("-p", "--project", help="Project name or code")
     p_ing.add_argument("--asset", help="Explicit asset sub-path inside repo/ (e.g. 'audio/lead_vocal' or 'midi/chords')")
     p_ing.add_argument("--author", default="", help="Original author / creator")
-    p_ing.add_argument("--source", default="", help="Original source URL, pack, or session")
+    p_ing.add_argument("--source", default="", help="Original source pack, session, or path")
+    p_ing.add_argument("--url", default="", help="Reference or download URL")
     p_ing.add_argument("--license", default="", help="License or usage rights (e.g. CC-BY-4.0, Royalty-Free)")
     p_ing.add_argument("--tag", action="append", default=[], help="Tag (can be specified multiple times)")
     p_ing.add_argument("-m", "--comment", default="", help="Version comment")
@@ -656,6 +657,7 @@ def run_cli(argv: Optional[list[str]] = None, hub: Optional[ObolHub] = None) -> 
             asset_path=args.asset,
             author=args.author,
             source_info=args.source,
+            url=args.url,
             license_info=args.license,
             tags=args.tag,
             comment=args.comment,
@@ -1121,11 +1123,17 @@ def run_cli(argv: Optional[list[str]] = None, hub: Optional[ObolHub] = None) -> 
                 "active_rpp": str(save_res.get("active_rpp") or primary_abs),
                 "switched_in_place": bool(save_res.get("switched_in_place", True)),
                 "reloaded": bool(save_res.get("reloaded", False)),
+                "reaper_version": str(save_res.get("reaper_version") or st.reaper_version or ""),
             }
             if args.json:
                 print(json.dumps(res))
             else:
-                print(f"Increment saved {target_comp}/{bundle.folder_rel} -> {primary_abs}")
+                suffix = (
+                    " (reloaded — upgrade REAPER to 7.34+ for in-place Save As without reloading)"
+                    if (res["reloaded"] or not res["switched_in_place"])
+                    else ""
+                )
+                print(f"Increment saved {target_comp}/{bundle.folder_rel} -> {primary_abs}{suffix}")
             return 0
 
         if args.reaper_cmd == "update-media":

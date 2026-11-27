@@ -6,10 +6,10 @@ from collections import Counter
 import csv
 from pathlib import Path
 import re
-from typing import Optional
+from typing import Any, Optional
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QBrush, QColor, QDragEnterEvent, QDropEvent
+from PySide6.QtCore import QSize, Qt, QUrl
+from PySide6.QtGui import QBrush, QColor, QDesktopServices, QDragEnterEvent, QDropEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -17,12 +17,14 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -36,6 +38,7 @@ from PySide6.QtWidgets import (
 
 from obol.core.hub import ObolHub
 from obol.core.models import (
+    FilePresence,
     ProjectTemplate,
     PublishItem,
     SoftwareProfile,
@@ -47,7 +50,18 @@ from obol.core.models import (
 from obol.core.seed_templates import normalize_software_key, normalize_template_name
 from obol.core.sync import SyncEngine
 from obol.core.workspace import ObolWorkspace
+from obol.gui.components import (
+    DialogFooter,
+    InlineStatusBanner,
+    attach_search_icon,
+    confirm_destructive_action,
+    open_folder_in_os,
+    run_with_busy_state,
+)
 from obol.gui.drop_widgets import DropTableWidget, extract_local_drop_paths
+from obol.gui.icons import get_icon
+from obol.gui.metadata_widgets import CustomMetadataEditor
+from obol.gui.tokens import ACCENT_LIGHT, ICON_BTN_SIZE, ICON_SM, TEXT_MUTED, TEXT_SECONDARY, WARNING_BG, WARNING_TEXT
 
 
 class SmartIngestDialog(QDialog):
@@ -65,6 +79,10 @@ class SmartIngestDialog(QDialog):
         existing_assets: Optional[dict[str, int]] = None,
         lock_asset_name: bool = False,
         suggested_paths: Optional[list[str]] = None,
+        default_url: str = "",
+        default_custom: Optional[dict[str, Any]] = None,
+        copied_metadata: Optional[dict[str, Any]] = None,
+        suggested_custom_keys: Optional[list[str]] = None,
     ) -> None:
         super().__init__(parent)
         if source_files:
@@ -77,13 +95,14 @@ class SmartIngestDialog(QDialog):
         self.existing_assets = dict(existing_assets or {})
         self.is_batch = len(self.source_files) > 1
         self._lock_asset_name = lock_asset_name
+        self._copied_metadata = dict(copied_metadata) if copied_metadata else None
         self.setAcceptDrops(True)
         self.setWindowTitle(
             f"Repo Ingest — {len(self.source_files)} Files"
             if self.is_batch
             else "Repo Ingest — Name, Version & Provenance"
         )
-        self.resize(640 if self.is_batch else 520, 460 if self.is_batch else 410)
+        self.resize(660 if self.is_batch else 540, 560 if self.is_batch else 520)
 
         layout = QVBoxLayout(self)
         if self.is_batch:
@@ -105,6 +124,8 @@ class SmartIngestDialog(QDialog):
 
         if self.is_batch:
             self.batch_table = QTableWidget(len(self.source_files), 4)
+            self.batch_table.verticalHeader().setVisible(False)
+            self.batch_table.setAlternatingRowColors(True)
             self.batch_table.setHorizontalHeaderLabels(["Source File", "Name", "Category", "Target Version"])
             self.batch_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
             self.batch_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -151,9 +172,9 @@ class SmartIngestDialog(QDialog):
 
             file_row = QHBoxLayout()
             self.file_path_edit = QLineEdit(str(self.source_file) if self.source_file else "")
-            self.file_path_edit.setPlaceholderText("Drop a file here or click Browse...")
+            self.file_path_edit.setPlaceholderText("Drop a file here or click Browse…")
             self.file_path_edit.setReadOnly(True)
-            browse_file_btn = QPushButton("Browse...")
+            browse_file_btn = QPushButton("Browse…")
             browse_file_btn.clicked.connect(self._browse_single_file)
             file_row.addWidget(self.file_path_edit, 1)
             file_row.addWidget(browse_file_btn)
@@ -164,6 +185,13 @@ class SmartIngestDialog(QDialog):
             self.preview_label.setObjectName("MutedText")
 
             form_top.addRow("Name:", self.name_edit)
+            if self._lock_asset_name:
+                self.lock_hint_label = QLabel(
+                    "Keep the current name to add the next version, or change it to create a new asset."
+                )
+                self.lock_hint_label.setObjectName("MutedText")
+                self.lock_hint_label.setWordWrap(True)
+                form_top.addRow("", self.lock_hint_label)
             form_top.addRow("Category (optional):", self.category_combo)
             form_top.addRow("Source File:", file_row)
             form_top.addRow("Target Version:", self.version_edit)
@@ -180,7 +208,9 @@ class SmartIngestDialog(QDialog):
         self.source_edit = QLineEdit(
             str(self.source_file.parent) if self.is_batch and self.source_file else (str(self.source_file) if self.source_file else "")
         )
-        self.source_edit.setPlaceholderText("URL, Sample Pack, or Studio Session")
+        self.source_edit.setPlaceholderText("Sample Pack, Studio Session, or Path")
+        self.url_edit = QLineEdit(default_url)
+        self.url_edit.setPlaceholderText("https://... (optional download or credit page)")
         self.license_combo = QComboBox()
         self.license_combo.setEditable(True)
         self.license_combo.addItems(["Original", "Royalty-Free", "CC-BY-4.0", "CC0", "Work for Hire", "Temp / Scratch Only"])
@@ -195,27 +225,64 @@ class SmartIngestDialog(QDialog):
         self.comment_edit.setPlaceholderText("Optional version note")
 
         form.addRow("Original Author / Creator:", self.author_edit)
-        form.addRow("Source (URL / Pack / Path):", self.source_edit)
+        form.addRow("Source (Pack / Path):", self.source_edit)
+        form.addRow("URL:", self.url_edit)
         form.addRow("License / Usage Rights:", self.license_combo)
         form.addRow("Tags:", self.tags_edit)
         form.addRow("Version Comment:", self.comment_edit)
         layout.addLayout(form)
 
-        btns = QHBoxLayout()
-        btns.addStretch()
+        self.custom_meta_editor = CustomMetadataEditor(self, hidden_keys={"seed_template"})
+        self.custom_meta_editor.set_data(default_custom or {}, suggested_keys=suggested_custom_keys)
+        layout.addWidget(self.custom_meta_editor)
+
+        self.paste_meta_btn = QPushButton("Paste Copied Metadata")
+        self.paste_meta_btn.setObjectName("SubtleToolButton")
+        self.paste_meta_btn.setIcon(get_icon("clipboard", TEXT_SECONDARY, ICON_SM))
+        self.paste_meta_btn.setIconSize(QSize(ICON_SM, ICON_SM))
+        self.paste_meta_btn.clicked.connect(self._apply_copied_metadata)
+        self.paste_meta_btn.setVisible(bool(self._copied_metadata))
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
         ok_btn = QPushButton(f"Ingest {len(self.source_files)} Files into repo/" if self.is_batch else "Ingest into repo/")
         ok_btn.setObjectName("PrimaryButton")
         ok_btn.setDefault(True)
         ok_btn.clicked.connect(self._validate_and_accept)
-        btns.addWidget(cancel_btn)
-        btns.addWidget(ok_btn)
-        layout.addLayout(btns)
+        layout.addWidget(
+            DialogFooter(
+                self,
+                left_widgets=[self.paste_meta_btn],
+                cancel_button=cancel_btn,
+                primary_button=ok_btn,
+            )
+        )
 
         if not self.is_batch:
             self.name_edit.setFocus()
             self.name_edit.selectAll()
+
+    def _apply_copied_metadata(self) -> None:
+        if not self._copied_metadata:
+            return
+        meta = self._copied_metadata
+        if "author" in meta:
+            self.author_edit.setText(str(meta.get("author") or ""))
+        if "source" in meta and str(meta.get("source") or "").strip():
+            self.source_edit.setText(str(meta.get("source") or ""))
+        if "url" in meta:
+            self.url_edit.setText(str(meta.get("url") or ""))
+        if "license" in meta and str(meta.get("license") or "").strip():
+            self.license_combo.setCurrentText(str(meta.get("license") or ""))
+        if "tags" in meta and isinstance(meta.get("tags"), list):
+            self.tags_edit.setText(", ".join(str(t) for t in meta["tags"] if str(t).strip()))
+        if "comment" in meta and str(meta.get("comment") or "").strip() and not self.comment_edit.text().strip():
+            self.comment_edit.setText(str(meta.get("comment") or ""))
+        if isinstance(meta.get("custom"), dict):
+            merged = dict(self.custom_meta_editor.get_data(include_hidden=False))
+            for k, v in meta["custom"].items():
+                if str(k).strip():
+                    merged[str(k).strip()] = "" if v is None else str(v)
+            self.custom_meta_editor.set_data(merged)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if not self.is_batch and extract_local_drop_paths(event):
@@ -312,17 +379,21 @@ class SmartIngestDialog(QDialog):
             "name": asset_path.split("/")[-1],
             "author": self.author_edit.text().strip(),
             "source_info": self.source_edit.text().strip(),
+            "url": self.url_edit.text().strip(),
             "license_info": self.license_combo.currentText().strip(),
             "tags": tags,
             "comment": self.comment_edit.text().strip(),
+            "custom": self.custom_meta_editor.get_data(include_hidden=False),
         }
 
     def get_batch_entries(self) -> list[dict[str, object]]:
         tags = [t.strip() for t in self.tags_edit.text().split(",") if t.strip()]
         author = self.author_edit.text().strip()
         source_info = self.source_edit.text().strip()
+        url_val = self.url_edit.text().strip()
         license_info = self.license_combo.currentText().strip()
         comment = self.comment_edit.text().strip()
+        custom_vals = self.custom_meta_editor.get_data(include_hidden=False)
         if not self.is_batch:
             vals = self.get_values()
             vals["source_file"] = self.source_file
@@ -342,9 +413,11 @@ class SmartIngestDialog(QDialog):
                 "name": name,
                 "author": author,
                 "source_info": str(sf) if (self.source_file and source_info == str(self.source_file.parent)) else source_info,
+                "url": url_val,
                 "license_info": license_info,
                 "tags": tags,
                 "comment": comment or f"Ingested from {sf.name}",
+                "custom": dict(custom_vals),
             })
         return entries
 
@@ -361,20 +434,29 @@ class NewProjectWizardDialog(QDialog):
         self.resize(860, 500)
 
         main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(14, 14, 14, 14)
+        main_layout.setSpacing(10)
         splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setHandleWidth(6)
 
         # Left form: Project identity & 3-tier template pickers
         left_widget = QWidget()
-        left_layout = QFormLayout(left_widget)
+        left_outer = QVBoxLayout(left_widget)
+        left_outer.setContentsMargins(0, 0, 6, 0)
+        left_outer.setSpacing(10)
+
+        left_layout = QFormLayout()
+        left_layout.setSpacing(7)
         self.name_edit = QLineEdit("new_project")
         self.code_edit = QLineEdit()
         self.code_edit.setPlaceholderText("Auto-generated from name (e.g. npr)")
 
         root_row = QHBoxLayout()
         self.root_dir_edit = QLineEdit(str(self.hub.get_client_root()))
-        browse_root_btn = QPushButton("Browse...")
+        browse_root_btn = QPushButton("Browse…")
         browse_root_btn.clicked.connect(self._browse_client_root)
-        root_tpl_btn = QPushButton("Root Seeds...")
+        root_tpl_btn = QPushButton("Root Seed Templates…")
+        root_tpl_btn.setObjectName("SubtleToolButton")
         root_tpl_btn.setToolTip("Manage per-software seed templates for this Client Workspace Root")
         root_tpl_btn.clicked.connect(self._open_root_seed_manager)
         root_row.addWidget(self.root_dir_edit, 1)
@@ -388,7 +470,8 @@ class NewProjectWizardDialog(QDialog):
             self.proj_tpl_combo.addItem(pt_name)
         proj_tpl_row = QHBoxLayout()
         proj_tpl_row.addWidget(self.proj_tpl_combo, 1)
-        edit_tpl_inline_btn = QPushButton("Configure Templates...")
+        edit_tpl_inline_btn = QPushButton("Configure Templates…")
+        edit_tpl_inline_btn.setObjectName("SubtleToolButton")
         edit_tpl_inline_btn.setToolTip("Open the 3-Tier Template Manager to create, edit, or import templates")
         edit_tpl_inline_btn.clicked.connect(self._open_template_manager)
         proj_tpl_row.addWidget(edit_tpl_inline_btn)
@@ -400,6 +483,33 @@ class NewProjectWizardDialog(QDialog):
         self.target_path_label = QLabel("")
         self.target_path_label.setObjectName("MutedText")
 
+        left_layout.addRow("Project Name:", self.name_edit)
+        left_layout.addRow("Project Code:", self.code_edit)
+        left_layout.addRow("Client Root:", root_row)
+        left_layout.addRow("", self.target_path_label)
+        left_layout.addRow("", self.remember_root_chk)
+        left_layout.addRow("Project Template:", proj_tpl_row)
+        left_layout.addRow("", self.tpl_desc_label)
+        left_outer.addLayout(left_layout)
+
+        # Grouped Customize Components Box
+        comp_box = QFrame()
+        comp_box.setObjectName("PanelCard")
+        comp_box_layout = QVBoxLayout(comp_box)
+        comp_box_layout.setContentsMargins(10, 10, 10, 10)
+        comp_box_layout.setSpacing(6)
+
+        comp_hdr = QLabel("Customize Components")
+        comp_hdr.setObjectName("SectionHeader")
+        comp_box_layout.addWidget(comp_hdr)
+
+        comp_hint = QLabel("Applies when adding a custom component or updating the highlighted one in the preview.")
+        comp_hint.setObjectName("MutedText")
+        comp_hint.setWordWrap(True)
+        comp_box_layout.addWidget(comp_hint)
+
+        comp_form = QFormLayout()
+        comp_form.setSpacing(6)
         self.task_tpl_combo = QComboBox()
         for tt_name in self.hub.template_manager.list_task_templates().keys():
             self.task_tpl_combo.addItem(tt_name)
@@ -411,36 +521,39 @@ class NewProjectWizardDialog(QDialog):
         self.custom_comp_edit = QLineEdit()
         self.custom_comp_edit.setPlaceholderText("e.g. song_3/audio or sfx/foley")
         self.custom_comp_edit.returnPressed.connect(self._add_custom_component)
+        comp_form.addRow("Component Template:", self.task_tpl_combo)
+        comp_form.addRow("Working Seed:", self.seed_tpl_combo)
+        comp_form.addRow("Component Path:", self.custom_comp_edit)
+        comp_box_layout.addLayout(comp_form)
+
         comp_btn_row = QHBoxLayout()
-        add_comp_btn = QPushButton("+ Add Component")
+        add_comp_btn = QPushButton("+ Add")
+        add_comp_btn.setObjectName("SubtleToolButton")
         add_comp_btn.clicked.connect(self._add_custom_component)
-        apply_comp_btn = QPushButton("Apply Template to Selected")
+        apply_comp_btn = QPushButton("Apply to Selected")
+        apply_comp_btn.setObjectName("SubtleToolButton")
         apply_comp_btn.setToolTip("Applies the selected Component Template & Seed File above to the highlighted component in the tree")
         apply_comp_btn.clicked.connect(self._apply_template_to_selected_component)
-        remove_comp_btn = QPushButton("Remove Selected")
+        remove_comp_btn = QPushButton("Remove")
+        remove_comp_btn.setObjectName("DangerButton")
         remove_comp_btn.clicked.connect(self._remove_selected_component)
         comp_btn_row.addWidget(add_comp_btn)
         comp_btn_row.addWidget(apply_comp_btn)
+        comp_btn_row.addStretch()
         comp_btn_row.addWidget(remove_comp_btn)
-
-        left_layout.addRow("Project Name:", self.name_edit)
-        left_layout.addRow("Project Code (optional):", self.code_edit)
-        left_layout.addRow("Client Root Path:", root_row)
-        left_layout.addRow("", self.target_path_label)
-        left_layout.addRow("", self.remember_root_chk)
-        left_layout.addRow("1. Project Hierarchy Template:", proj_tpl_row)
-        left_layout.addRow("", self.tpl_desc_label)
-        left_layout.addRow("2. Component Template:", self.task_tpl_combo)
-        left_layout.addRow("3. Working Seed File:", self.seed_tpl_combo)
-        left_layout.addRow("Custom Component Path:", self.custom_comp_edit)
-        left_layout.addRow("", comp_btn_row)
+        comp_box_layout.addLayout(comp_btn_row)
+        left_outer.addWidget(comp_box)
+        left_outer.addStretch(1)
 
         # Right side: Live interactive folder tree preview
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
-        lbl = QLabel("Live Folder Tree Preview (Triads & Initial v001 Seed Files):")
+        right_layout.setContentsMargins(6, 0, 0, 0)
+        lbl = QLabel("Live Folder Tree Preview")
         lbl.setObjectName("SectionHeader")
         self.preview_tree = QTreeWidget()
+        self.preview_tree.setAlternatingRowColors(True)
+        self.preview_tree.setIndentation(14)
         self.preview_tree.setHeaderLabels(["Folder / Seed File", "Role / Template"])
         self.preview_tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
         self.preview_tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
@@ -450,22 +563,15 @@ class NewProjectWizardDialog(QDialog):
 
         splitter.addWidget(left_widget)
         splitter.addWidget(right_widget)
-        splitter.setSizes([350, 510])
-        main_layout.addWidget(splitter)
+        splitter.setSizes([380, 480])
+        main_layout.addWidget(splitter, 1)
 
-        btns = QHBoxLayout()
-        manage_tpl_btn = QPushButton("Manage Templates...")
-        manage_tpl_btn.clicked.connect(self._open_template_manager)
-        btns.addWidget(manage_tpl_btn)
-        btns.addStretch()
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
-        create_btn = QPushButton("Initialize Project from Template")
+        create_btn = QPushButton("Create Project")
         create_btn.setObjectName("PrimaryButton")
         create_btn.clicked.connect(self._create_project)
-        btns.addWidget(cancel_btn)
-        btns.addWidget(create_btn)
-        main_layout.addLayout(btns)
+        main_layout.addWidget(DialogFooter(self, cancel_button=cancel_btn, primary_button=create_btn))
 
         self._active_components: list[str] = []
         self._comp_task_overrides: dict[str, str] = {}
@@ -749,17 +855,13 @@ class AddComponentDialog(QDialog):
         form.addRow("", self.seed_chk)
         layout.addLayout(form)
 
-        btns = QHBoxLayout()
-        btns.addStretch()
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
         create_btn = QPushButton("Create Component")
         create_btn.setObjectName("PrimaryButton")
         create_btn.setDefault(True)
         create_btn.clicked.connect(self._validate_and_accept)
-        btns.addWidget(cancel_btn)
-        btns.addWidget(create_btn)
-        layout.addLayout(btns)
+        layout.addWidget(DialogFooter(self, cancel_button=cancel_btn, primary_button=create_btn))
 
         self.task_tpl_combo.currentTextChanged.connect(self._on_template_changed)
         self.software_combo.activated.connect(self._on_software_user_selected)
@@ -893,7 +995,7 @@ class SoftwareSettingsDialog(QDialog):
         self.exe_edit.setPlaceholderText("Optional path to .exe / app binary (blank = OS default)")
         exe_row = QHBoxLayout()
         exe_row.addWidget(self.exe_edit, 1)
-        browse_exe_btn = QPushButton("Browse...")
+        browse_exe_btn = QPushButton("Browse…")
         browse_exe_btn.clicked.connect(self._browse_executable)
         auto_exe_btn = QPushButton("Auto-Detect")
         auto_exe_btn.clicked.connect(self._auto_detect_executable)
@@ -922,18 +1024,25 @@ class SoftwareSettingsDialog(QDialog):
         form.addRow("", self.lock_chk)
         form.addRow("Python Hook Plugin:", self.plugin_combo)
 
-        btn_row = QHBoxLayout()
+        self.feedback_banner = InlineStatusBanner(self)
+        form.addRow("", self.feedback_banner)
+
         save_btn = QPushButton("Save / Add Software Profile")
         save_btn.setObjectName("PrimaryButton")
         save_btn.clicked.connect(self._save_current)
-        integ_btn = QPushButton("DCC Integrations...")
+        integ_btn = QPushButton("DCC Integrations…")
         integ_btn.clicked.connect(self._open_integrations_manager)
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
-        btn_row.addWidget(save_btn)
-        btn_row.addWidget(integ_btn)
-        btn_row.addWidget(close_btn)
-        form.addRow("", btn_row)
+        form.addRow(
+            "",
+            DialogFooter(
+                self,
+                left_widgets=[integ_btn],
+                cancel_button=close_btn,
+                primary_button=save_btn,
+            ),
+        )
 
         layout.addWidget(right, 2)
         self.exe_edit.textChanged.connect(self._update_exe_status)
@@ -1033,7 +1142,7 @@ class SoftwareSettingsDialog(QDialog):
     def _save_current(self) -> None:
         k = self.key_edit.text().strip().lower()
         if not k:
-            QMessageBox.warning(self, "Validation", "Profile Key is required (e.g. 'reaper' or 'davinci').")
+            self.feedback_banner.set_feedback("Profile Key is required (e.g. 'reaper' or 'davinci').", "warn")
             return
         exts = [e.strip() for e in self.ext_edit.text().split(",") if e.strip()]
         ignores = [p.strip() for p in self.ignore_edit.text().split(",") if p.strip()]
@@ -1050,6 +1159,7 @@ class SoftwareSettingsDialog(QDialog):
         )
         self.hub.set_software_profile(prof)
         self._refresh_list(select_key=k)
+        self.feedback_banner.set_feedback(f"✓ Saved software profile '{k}'", "ok")
 
 
 class ProjectAndVaultManagerDialog(QDialog):
@@ -1069,12 +1179,13 @@ class ProjectAndVaultManagerDialog(QDialog):
         client_row = QHBoxLayout()
         self.client_root_edit = QLineEdit(str(self.hub.get_client_root()))
         self.client_root_edit.setPlaceholderText("Local Client Root directory (e.g. D:\\ObolWork)")
-        browse_client_btn = QPushButton("Browse...")
+        browse_client_btn = QPushButton("Browse…")
         browse_client_btn.clicked.connect(self._browse_client_root)
         save_client_btn = QPushButton("Set Client Root")
-        save_client_btn.setObjectName("PrimaryButton")
+        save_client_btn.setObjectName("SubtleToolButton")
         save_client_btn.clicked.connect(self._save_client_root)
-        root_tpls_btn = QPushButton("Root Templates...")
+        root_tpls_btn = QPushButton("Root Seed Templates…")
+        root_tpls_btn.setObjectName("SubtleToolButton")
         root_tpls_btn.setToolTip("Manage versioned per-software seed templates for this Client Workspace Root")
         root_tpls_btn.clicked.connect(self._open_root_templates)
         client_row.addWidget(QLabel("Client Root (Local):"))
@@ -1088,7 +1199,7 @@ class ProjectAndVaultManagerDialog(QDialog):
         vault_row = QHBoxLayout()
         self.vault_path_edit = QLineEdit(self.hub.config.vault.path)
         self.vault_path_edit.setPlaceholderText("Optional SMB/NAS path (e.g. \\\\NAS\\ObolVault or Z:\\ObolVault)")
-        browse_btn = QPushButton("Browse...")
+        browse_btn = QPushButton("Browse…")
         browse_btn.clicked.connect(self._browse_vault)
         self.connect_btn = QPushButton()
         self.connect_btn.clicked.connect(self._toggle_vault)
@@ -1098,26 +1209,33 @@ class ProjectAndVaultManagerDialog(QDialog):
         vault_row.addWidget(self.connect_btn)
         layout.addLayout(vault_row)
 
+        self.feedback_banner = InlineStatusBanner(self)
+        layout.addWidget(self.feedback_banner)
+
         # Projects Table
         self.table = QTableWidget(0, 4)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setHorizontalHeaderLabels(["Project", "Presence", "Local Path", "Actions"])
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.table.cellDoubleClicked.connect(self._on_row_double_clicked)
         layout.addWidget(self.table)
 
-        bottom = QHBoxLayout()
-        new_proj_btn = QPushButton("+ New Project...")
+        new_proj_btn = QPushButton("+ New Project…")
         new_proj_btn.setObjectName("PrimaryButton")
         new_proj_btn.clicked.connect(self._create_new_project_from_manager)
-        reg_proj_btn = QPushButton("Register Existing Project Folder...")
+        reg_proj_btn = QPushButton("Register Existing Project Folder…")
         reg_proj_btn.clicked.connect(self._register_existing_project_folder)
-        bottom.addWidget(new_proj_btn)
-        bottom.addWidget(reg_proj_btn)
-        bottom.addStretch()
         close_btn = QPushButton("Done")
         close_btn.clicked.connect(self.accept)
-        bottom.addWidget(close_btn)
-        layout.addLayout(bottom)
+        layout.addWidget(
+            DialogFooter(
+                self,
+                left_widgets=[new_proj_btn, reg_proj_btn],
+                cancel_button=close_btn,
+            )
+        )
 
         self._refresh_view()
 
@@ -1150,10 +1268,12 @@ class ProjectAndVaultManagerDialog(QDialog):
     def _save_client_root(self) -> None:
         p = self.client_root_edit.text().strip()
         if not p:
+            self.feedback_banner.set_feedback("Enter a Client Workspace Root folder first.", "warn")
             return
         new_root = self.hub.set_client_root(Path(p))
         self.client_root_edit.setText(str(new_root))
         self._refresh_view()
+        self.feedback_banner.set_feedback(f"✓ Client Root set to {new_root}", "ok")
 
     def _open_root_templates(self) -> None:
         p = self.client_root_edit.text().strip()
@@ -1169,12 +1289,14 @@ class ProjectAndVaultManagerDialog(QDialog):
     def _toggle_vault(self) -> None:
         if self.hub.get_vault_status() == VaultStatus.ONLINE:
             self.hub.disconnect_vault()
+            self.feedback_banner.set_feedback("Disconnected Server Vault (Local Mode)", "info")
         else:
             p = self.vault_path_edit.text().strip()
             if not p:
-                QMessageBox.information(self, "Server Vault", "Enter or browse to a folder / SMB path to connect.")
+                self.feedback_banner.set_feedback("Enter or browse to a folder / SMB path to connect.", "warn")
                 return
             self.hub.connect_vault(Path(p))
+            self.feedback_banner.set_feedback(f"✓ Connected Server Vault: {p}", "ok")
         self._refresh_view()
 
     def _refresh_view(self) -> None:
@@ -1183,6 +1305,14 @@ class ProjectAndVaultManagerDialog(QDialog):
         projects = self.hub.list_projects()
         active_name = self.hub.config.last_active_project
         self.table.setRowCount(len(projects))
+
+        presence_labels = {
+            FilePresence.LOCAL_ONLY: "Local Only",
+            FilePresence.SYNCED: "Synced",
+            FilePresence.MODIFIED_LOCAL: "Modified Locally",
+            FilePresence.REMOTE_ONLY: "Vault Only",
+            FilePresence.SPARSE: "Partial (Sparse)",
+        }
 
         for row_idx, entry in enumerate(projects):
             pres = self.sync.compute_project_presence(entry.name)
@@ -1195,7 +1325,9 @@ class ProjectAndVaultManagerDialog(QDialog):
                 font.setBold(True)
                 name_item.setFont(font)
 
-            pres_item = QTableWidgetItem(pres.value)
+            pres_label = presence_labels.get(pres, pres.value)
+            pres_item = QTableWidgetItem(pres_label)
+            pres_item.setToolTip(pres.value)
             pres_item.setFlags(pres_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             path_item = QTableWidgetItem(entry.local_path)
             path_item.setFlags(path_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -1206,30 +1338,37 @@ class ProjectAndVaultManagerDialog(QDialog):
 
             act_widget = QWidget()
             act_layout = QHBoxLayout(act_widget)
-            act_layout.setContentsMargins(2, 2, 2, 2)
+            act_layout.setContentsMargins(4, 2, 4, 2)
+            act_layout.setSpacing(4)
             open_btn = QPushButton("Open" if entry.name != active_name else "Active")
-            if entry.name != active_name:
-                open_btn.setObjectName("PrimaryButton")
+            open_btn.setObjectName("SubtleToolButton")
+            if entry.name == active_name:
+                open_btn.setEnabled(False)
             open_btn.clicked.connect(lambda _=False, n=entry.name: self._select_proj(n))
             act_layout.addWidget(open_btn)
 
+            more_btn = QPushButton()
+            more_btn.setObjectName("SubtleToolButton")
+            more_btn.setIcon(get_icon("more_horiz", TEXT_MUTED, ICON_SM))
+            more_btn.setIconSize(QSize(ICON_SM, ICON_SM))
+            more_btn.setFixedSize(ICON_BTN_SIZE, ICON_BTN_SIZE)
+            more_btn.setToolTip("Vault & project actions")
+            row_menu = QMenu(more_btn)
             if st == VaultStatus.ONLINE:
-                push_btn = QPushButton("Backup")
-                push_btn.clicked.connect(lambda _=False, n=entry.name: self._push_proj(n, False))
-                arch_btn = QPushButton("Archive (Free Space)")
-                arch_btn.clicked.connect(lambda _=False, n=entry.name: self._push_proj(n, True))
-                co_btn = QPushButton("Check Out")
-                co_btn.clicked.connect(lambda _=False, n=entry.name: self._checkout_proj(n))
-                act_layout.addWidget(push_btn)
-                act_layout.addWidget(arch_btn)
-                act_layout.addWidget(co_btn)
-
-            del_btn = QPushButton("Remove...")
-            del_btn.setObjectName("DangerButton")
-            del_btn.clicked.connect(lambda _=False, n=entry.name: self._delete_proj(n))
-            act_layout.addWidget(del_btn)
+                act_push = row_menu.addAction("Backup to Vault")
+                act_push.triggered.connect(lambda _=False, n=entry.name: self._push_proj(n, False))
+                act_arch = row_menu.addAction("Archive (Free Space)")
+                act_arch.triggered.connect(lambda _=False, n=entry.name: self._push_proj(n, True))
+                act_co = row_menu.addAction("Check Out from Vault")
+                act_co.triggered.connect(lambda _=False, n=entry.name: self._checkout_proj(n))
+                row_menu.addSeparator()
+            act_del = row_menu.addAction("Remove Project…")
+            act_del.triggered.connect(lambda _=False, n=entry.name: self._delete_proj(n))
+            more_btn.setMenu(row_menu)
+            act_layout.addWidget(more_btn)
 
             self.table.setCellWidget(row_idx, 3, act_widget)
+            self.table.setRowHeight(row_idx, 36)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
 
     def _on_row_double_clicked(self, row: int, _col: int) -> None:
@@ -1268,14 +1407,37 @@ class ProjectAndVaultManagerDialog(QDialog):
         if self.selected_project_name == entry.name:
             self.selected_project_name = None
         self._refresh_view()
+        self.feedback_banner.set_feedback(f"Removed project '{entry.name}'", "info")
 
     def _push_proj(self, name: str, evict: bool) -> None:
-        self.sync.push_paths(name, ["**"], evict_local=evict)
-        self._refresh_view()
+        run_with_busy_state(
+            self,
+            lambda: self.sync.push_paths(name, ["**"], evict_local=evict),
+            on_success=lambda _res: (
+                self._refresh_view(),
+                self.feedback_banner.set_feedback(
+                    f"✓ {'Archived' if evict else 'Backed up'} '{name}' to Vault", "ok"
+                ),
+            ),
+            on_error=lambda exc: self.feedback_banner.set_feedback(str(exc), "err"),
+            disable_widgets=[self.table],
+            busy_message=f"{'Archiving' if evict else 'Backing up'} '{name}'…",
+            status_callback=lambda msg: self.feedback_banner.set_feedback(msg, "info"),
+        )
 
     def _checkout_proj(self, name: str) -> None:
-        self.sync.pull_paths(name, ["**"])
-        self._refresh_view()
+        run_with_busy_state(
+            self,
+            lambda: self.sync.pull_paths(name, ["**"]),
+            on_success=lambda _res: (
+                self._refresh_view(),
+                self.feedback_banner.set_feedback(f"✓ Checked out '{name}' from Vault", "ok"),
+            ),
+            on_error=lambda exc: self.feedback_banner.set_feedback(str(exc), "err"),
+            disable_widgets=[self.table],
+            busy_message=f"Checking out '{name}'…",
+            status_callback=lambda msg: self.feedback_banner.set_feedback(msg, "info"),
+        )
 
 
 class CreditsReportDialog(QDialog):
@@ -1292,8 +1454,9 @@ class CreditsReportDialog(QDialog):
         top_bar = QHBoxLayout()
         self.filter_edit = QLineEdit()
         self.filter_edit.setObjectName("FilterInput")
-        self.filter_edit.setPlaceholderText("Filter by component, asset, author, source, or license...")
+        self.filter_edit.setPlaceholderText("Filter by component, asset, author, source, or license…")
         self.filter_edit.setClearButtonEnabled(True)
+        attach_search_icon(self.filter_edit)
         self.filter_edit.textChanged.connect(self._apply_filter)
         self.summary_label = QLabel("")
         self.summary_label.setObjectName("MutedText")
@@ -1301,19 +1464,23 @@ class CreditsReportDialog(QDialog):
         top_bar.addWidget(self.summary_label)
         layout.addLayout(top_bar)
 
-        self.table = QTableWidget(len(self.rows), 7)
+        self.table = QTableWidget(len(self.rows), 8)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setHorizontalHeaderLabels(
-            ["Component", "Repo Asset", "Latest", "Used In", "Author", "Source", "License"]
+            ["Component", "Repo Asset", "Latest", "Used In", "Author", "Source", "URL", "License"]
         )
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
 
         warn_count = 0
         for i, r in enumerate(self.rows):
             used_raw = r.get("used_by_working", [])
             used_str = ", ".join(str(x) for x in used_raw) if isinstance(used_raw, list) else str(used_raw or "")
             lic_str = str(r.get("license", "Unspecified"))
+            url_str = str(r.get("url", ""))
             vals = [
                 str(r.get("component", "")),
                 f"repo/{r.get('asset_path', '')}",
@@ -1321,51 +1488,79 @@ class CreditsReportDialog(QDialog):
                 used_str or "—",
                 str(r.get("author", "")),
                 str(r.get("source", "")),
+                url_str,
                 lic_str,
             ]
             for col_idx, val in enumerate(vals):
                 item = QTableWidgetItem(val)
-                if col_idx == 6 and (lic_str == "Unspecified" or "temp" in lic_str.lower() or "scratch" in lic_str.lower()):
-                    item.setForeground(QBrush(QColor("#fde68a")))
-                    item.setBackground(QBrush(QColor("#451a03")))
+                if col_idx == 6 and url_str:
+                    item.setForeground(QBrush(QColor(ACCENT_LIGHT)))
+                    item.setToolTip(f"Click to open: {url_str}")
+                if col_idx == 7 and (lic_str == "Unspecified" or "temp" in lic_str.lower() or "scratch" in lic_str.lower()):
+                    item.setForeground(QBrush(QColor(WARNING_TEXT)))
+                    item.setBackground(QBrush(QColor(WARNING_BG)))
                     item.setToolTip("Review license/clearance before publishing")
                     warn_count += 1
                 self.table.setItem(i, col_idx, item)
+        self.table.cellClicked.connect(self._on_cell_clicked)
+        self.table.cellDoubleClicked.connect(self._on_cell_double_clicked)
         layout.addWidget(self.table, 1)
+
+        self.empty_filter_label = QLabel("No matching credits")
+        self.empty_filter_label.setObjectName("MutedText")
+        self.empty_filter_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_filter_label.hide()
+        layout.addWidget(self.empty_filter_label)
 
         if warn_count:
             self.summary_label.setText(f"{len(self.rows)} assets  •  ⚠ {warn_count} need license review")
         else:
             self.summary_label.setText(f"{len(self.rows)} repo assets")
 
-        footer = QHBoxLayout()
         copy_md_btn = QPushButton("Copy Credits (Markdown)")
         copy_md_btn.clicked.connect(self._copy_markdown)
-        export_csv_btn = QPushButton("Export CSV...")
+        export_csv_btn = QPushButton("Export CSV…")
         export_csv_btn.clicked.connect(self._export_csv)
         self.copy_status_lbl = QLabel("")
         self.copy_status_lbl.setObjectName("SuccessText")
         close_btn = QPushButton("Close")
-        close_btn.setObjectName("PrimaryButton")
+        close_btn.setObjectName("SubtleToolButton")
         close_btn.clicked.connect(self.accept)
-        footer.addWidget(copy_md_btn)
-        footer.addWidget(export_csv_btn)
-        footer.addWidget(self.copy_status_lbl)
-        footer.addStretch()
-        footer.addWidget(close_btn)
-        layout.addLayout(footer)
+        layout.addWidget(
+            DialogFooter(
+                self,
+                left_widgets=[copy_md_btn, export_csv_btn, self.copy_status_lbl],
+                cancel_button=close_btn,
+            )
+        )
+
+    def _on_cell_clicked(self, row: int, col: int) -> None:
+        self._on_cell_double_clicked(row, col)
+
+    def _on_cell_double_clicked(self, row: int, col: int) -> None:
+        if col != 6:
+            return
+        item = self.table.item(row, col)
+        url_txt = item.text().strip() if item else ""
+        if url_txt:
+            QDesktopServices.openUrl(QUrl.fromUserInput(url_txt))
 
     def _apply_filter(self, text: str) -> None:
         needle = text.strip().lower()
+        visible_count = 0
         for row_idx in range(self.table.rowCount()):
             if not needle:
                 self.table.setRowHidden(row_idx, False)
+                visible_count += 1
                 continue
             matched = any(
                 needle in (self.table.item(row_idx, c).text().lower() if self.table.item(row_idx, c) else "")
                 for c in range(self.table.columnCount())
             )
             self.table.setRowHidden(row_idx, not matched)
+            if matched:
+                visible_count += 1
+        self.empty_filter_label.setVisible(bool(needle) and self.table.rowCount() > 0 and visible_count == 0)
 
     def format_markdown(self) -> str:
         lines = [f"# Attribution & Credits — {self.project_name}", ""]
@@ -1373,10 +1568,11 @@ class CreditsReportDialog(QDialog):
             lines.append("_No repo assets registered in this project._")
             return "\n".join(lines)
         for r in self.rows:
+            url_part = f" | URL: {r.get('url')}" if r.get("url") else ""
             lines.append(
                 f"- **{r.get('asset_path', '')}** ({r.get('latest_version', '')}, `{r.get('component', '')}`) — "
                 f"Author: {r.get('author', 'Unspecified')} | License: {r.get('license', 'Unspecified')} | "
-                f"Source: {r.get('source', 'Unspecified')}"
+                f"Source: {r.get('source', 'Unspecified')}{url_part}"
             )
         return "\n".join(lines)
 
@@ -1397,7 +1593,7 @@ class CreditsReportDialog(QDialog):
             return
         with open(dest_str, "w", newline="", encoding="utf-8") as fh:
             writer = csv.writer(fh)
-            writer.writerow(["Component", "Repo Asset", "Latest", "Used In", "Author", "Source", "License", "Tags"])
+            writer.writerow(["Component", "Repo Asset", "Latest", "Used In", "Author", "Source", "URL", "License", "Tags"])
             for r in self.rows:
                 used_raw = r.get("used_by_working", [])
                 used_str = ", ".join(str(x) for x in used_raw) if isinstance(used_raw, list) else str(used_raw or "")
@@ -1408,6 +1604,7 @@ class CreditsReportDialog(QDialog):
                     used_str,
                     r.get("author", ""),
                     r.get("source", ""),
+                    r.get("url", ""),
                     r.get("license", ""),
                     r.get("tags", ""),
                 ])
@@ -1488,17 +1685,13 @@ class SaveSeedTemplateDialog(QDialog):
         form.addRow("", self.pin_version_chk)
         layout.addLayout(form)
 
-        btns = QHBoxLayout()
-        btns.addStretch()
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
         save_btn = QPushButton("Save Seed Template")
         save_btn.setObjectName("PrimaryButton")
         save_btn.setDefault(True)
         save_btn.clicked.connect(self._save)
-        btns.addWidget(cancel_btn)
-        btns.addWidget(save_btn)
-        layout.addLayout(btns)
+        layout.addWidget(DialogFooter(self, cancel_button=cancel_btn, primary_button=save_btn))
 
         self.software_combo.currentIndexChanged.connect(self._refresh_streams)
         self.scope_combo.currentIndexChanged.connect(self._refresh_streams)
@@ -1700,7 +1893,7 @@ class TemplateManagerDialog(QDialog):
 
         self.seed_root_lbl = QLabel("Root:")
         self.seed_root_edit = QLineEdit(str(self._seed_client_root))
-        self.seed_browse_root_btn = QPushButton("Browse Root...")
+        self.seed_browse_root_btn = QPushButton("Browse Root…")
         self.seed_browse_root_btn.clicked.connect(self._browse_seed_root)
         scope_bar.addWidget(self.seed_root_lbl)
         scope_bar.addWidget(self.seed_root_edit, 1)
@@ -1736,7 +1929,7 @@ class TemplateManagerDialog(QDialog):
         stream_layout.addWidget(self.seed_stream_list, 1)
 
         stream_btns_top = QHBoxLayout()
-        self.seed_import_btn = QPushButton("+ Import / New...")
+        self.seed_import_btn = QPushButton("+ Import / New…")
         self.seed_import_btn.setObjectName("PrimaryButton")
         self.seed_import_btn.clicked.connect(self._seed_import_new)
         self.seed_set_default_btn = QPushButton("Set Default")
@@ -1774,6 +1967,8 @@ class TemplateManagerDialog(QDialog):
         ver_layout.addLayout(ver_top_row)
 
         self.seed_versions_table = QTableWidget(0, 5)
+        self.seed_versions_table.verticalHeader().setVisible(False)
+        self.seed_versions_table.setAlternatingRowColors(True)
         self.seed_versions_table.setHorizontalHeaderLabels(["Version", "Primary File", "Default", "Created", "Note"])
         self.seed_versions_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.seed_versions_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -1782,29 +1977,32 @@ class TemplateManagerDialog(QDialog):
         ver_layout.addWidget(self.seed_versions_table, 1)
 
         ver_btns = QHBoxLayout()
-        self.seed_add_ver_btn = QPushButton("+ Add Version...")
-        self.seed_add_ver_btn.clicked.connect(self._seed_add_version_to_stream)
-        self.seed_vup_open_btn = QPushButton("Version Up & Open")
+        ver_btns.setSpacing(6)
+        self.seed_vup_open_btn = QPushButton("Version Up && Open")
         self.seed_vup_open_btn.setObjectName("PrimaryButton")
         self.seed_vup_open_btn.clicked.connect(lambda: self._seed_version_up(open_in_app=True))
-        self.seed_open_btn = QPushButton("Open in App")
-        self.seed_open_btn.clicked.connect(self._seed_open_selected_version)
-        self.seed_note_btn = QPushButton("Edit Note")
-        self.seed_note_btn.clicked.connect(self._seed_edit_version_note)
-        self.seed_del_ver_btn = QPushButton("Delete Ver")
-        self.seed_del_ver_btn.setObjectName("DangerButton")
-        self.seed_del_ver_btn.clicked.connect(self._seed_delete_version)
-        self.seed_open_dir_btn = QPushButton("Open Folder")
-        self.seed_open_dir_btn.clicked.connect(self._seed_open_scope_folder)
-        for b in (
-            self.seed_add_ver_btn,
-            self.seed_vup_open_btn,
-            self.seed_open_btn,
-            self.seed_note_btn,
-            self.seed_del_ver_btn,
-            self.seed_open_dir_btn,
-        ):
-            ver_btns.addWidget(b)
+        self.seed_add_ver_btn = QPushButton("+ Add Version…")
+        self.seed_add_ver_btn.setObjectName("SubtleToolButton")
+        self.seed_add_ver_btn.clicked.connect(self._seed_add_version_to_stream)
+
+        seed_more_btn = QPushButton("More")
+        seed_more_btn.setObjectName("SubtleToolButton")
+        seed_more_menu = QMenu(seed_more_btn)
+        act_s_open = seed_more_menu.addAction("Open in App")
+        act_s_open.triggered.connect(self._seed_open_selected_version)
+        act_s_note = seed_more_menu.addAction("Edit Version Note…")
+        act_s_note.triggered.connect(self._seed_edit_version_note)
+        act_s_dir = seed_more_menu.addAction("Open Scope Folder")
+        act_s_dir.triggered.connect(self._seed_open_scope_folder)
+        seed_more_menu.addSeparator()
+        act_s_del = seed_more_menu.addAction("Delete Version")
+        act_s_del.triggered.connect(self._seed_delete_version)
+        seed_more_btn.setMenu(seed_more_menu)
+
+        ver_btns.addWidget(self.seed_vup_open_btn)
+        ver_btns.addWidget(self.seed_add_ver_btn)
+        ver_btns.addStretch()
+        ver_btns.addWidget(seed_more_btn)
         ver_layout.addLayout(ver_btns)
         seed_splitter.addWidget(ver_pane)
 
@@ -1816,17 +2014,19 @@ class TemplateManagerDialog(QDialog):
         tab_files = QWidget()
         tf_layout = QVBoxLayout(tab_files)
         self.seed_files_table = QTableWidget(0, 3)
+        self.seed_files_table.verticalHeader().setVisible(False)
+        self.seed_files_table.setAlternatingRowColors(True)
         self.seed_files_table.setHorizontalHeaderLabels(["Seed Filename", "Extension", "Full Template Path"])
         self.seed_files_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         tf_layout.addWidget(self.seed_files_table)
 
         tf_btns = QHBoxLayout()
-        imp_seed_btn = QPushButton("+ Import Seed File from Disk...")
+        imp_seed_btn = QPushButton("+ Import Seed File from Disk…")
         imp_seed_btn.setObjectName("PrimaryButton")
         imp_seed_btn.clicked.connect(self._import_seed_file)
         edit_seed_btn = QPushButton("Open Selected Seed File in App")
         edit_seed_btn.clicked.connect(self._open_selected_seed_file)
-        mig_seed_btn = QPushButton("Migrate to Versioned Seed...")
+        mig_seed_btn = QPushButton("Migrate to Versioned Seed…")
         mig_seed_btn.clicked.connect(self._migrate_selected_legacy_seed)
         del_seed_btn = QPushButton("Delete Selected Seed File")
         del_seed_btn.clicked.connect(self._delete_selected_seed_file)
@@ -1840,18 +2040,22 @@ class TemplateManagerDialog(QDialog):
 
         root_layout.addWidget(self.tabs)
 
-        footer = QHBoxLayout()
+        self.feedback_banner = InlineStatusBanner(self)
+        root_layout.addWidget(self.feedback_banner)
+
         path_lbl = QLabel(f"Global Templates: {self.tm.templates_root}")
         path_lbl.setObjectName("MutedText")
         open_dir_btn = QPushButton("Open Templates Folder in Explorer")
         open_dir_btn.clicked.connect(self._open_templates_folder)
         close_dlg_btn = QPushButton("Done")
         close_dlg_btn.clicked.connect(self.accept)
-        footer.addWidget(path_lbl)
-        footer.addStretch()
-        footer.addWidget(open_dir_btn)
-        footer.addWidget(close_dlg_btn)
-        root_layout.addLayout(footer)
+        root_layout.addWidget(
+            DialogFooter(
+                self,
+                left_widgets=[path_lbl, open_dir_btn],
+                cancel_button=close_dlg_btn,
+            )
+        )
 
         self.seed_scope_combo.currentIndexChanged.connect(self._on_seed_scope_changed)
         self.seed_root_edit.editingFinished.connect(self._on_seed_root_edited)
@@ -2040,8 +2244,9 @@ class TemplateManagerDialog(QDialog):
         for row_idx, v in enumerate(vers_desc):
             p_abs = sw_dir / v.primary_file
             is_ro = p_abs.is_file() and not (p_abs.stat().st_mode & 0o200)
-            lock_icon = " 🔒" if is_ro else ""
-            ver_item = QTableWidgetItem(f"{v.version_label}{lock_icon}")
+            ver_item = QTableWidgetItem(v.version_label)
+            if is_ro:
+                ver_item.setIcon(get_icon("lock", TEXT_MUTED, ICON_SM))
             ver_item.setData(Qt.ItemDataRole.UserRole, v.version)
 
             file_item = QTableWidgetItem(Path(v.primary_file).name)
@@ -2245,11 +2450,19 @@ class TemplateManagerDialog(QDialog):
         )
         self._refresh_seed_tab()
 
-    def _seed_delete_version(self) -> None:
+    def _seed_delete_version(self, confirm: bool = True) -> None:
         sw = self._selected_seed_software()
         tname = self._selected_seed_stream_name()
         ver = self._selected_seed_version_num()
         if not tname or ver is None:
+            return
+        if confirm and not confirm_destructive_action(
+            self,
+            "Delete Seed Version",
+            f"Delete seed template '{tname}' v{ver:03d} ({sw})?",
+            confirm_label=f"Delete v{ver:03d}",
+            informative_text="This cannot be undone.",
+        ):
             return
         self.tm.seeds.delete_version(
             sw,
@@ -2260,11 +2473,20 @@ class TemplateManagerDialog(QDialog):
             client_root=self._seed_root_path(),
         )
         self._refresh_seed_tab()
+        self.feedback_banner.set_feedback(f"Deleted seed '{tname}' v{ver:03d}", "info")
 
-    def _seed_delete_stream(self) -> None:
+    def _seed_delete_stream(self, confirm: bool = True) -> None:
         sw = self._selected_seed_software()
         tname = self._selected_seed_stream_name()
         if not tname:
+            return
+        if confirm and not confirm_destructive_action(
+            self,
+            "Delete Seed Template",
+            f"Delete named seed template '{tname}' ({sw}) and all its versions?",
+            confirm_label="Delete Template",
+            informative_text="This cannot be undone.",
+        ):
             return
         self.tm.seeds.delete_template(
             sw,
@@ -2274,19 +2496,16 @@ class TemplateManagerDialog(QDialog):
             client_root=self._seed_root_path(),
         )
         self._refresh_seed_tab()
+        self.feedback_banner.set_feedback(f"Deleted seed template '{tname}'", "info")
 
     def _seed_open_scope_folder(self) -> None:
-        import os
-        import sys
-
         seeds_dir = self.tm.seeds.get_seeds_dir(
             self._seed_scope(),
             project_root=self.active_project_root,
             client_root=self._seed_root_path(),
         )
         seeds_dir.mkdir(parents=True, exist_ok=True)
-        if sys.platform == "win32" and hasattr(os, "startfile"):
-            os.startfile(str(seeds_dir))
+        open_folder_in_os(seeds_dir)
 
     def _migrate_selected_legacy_seed(self) -> None:
         row = self.seed_files_table.currentRow()
@@ -2375,20 +2594,35 @@ class TemplateManagerDialog(QDialog):
         )
         self.tm.save_project_template(pt)
         self._refresh_all_lists()
+        matches = self.proj_tpl_list.findItems(name, Qt.MatchFlag.MatchExactly)
+        if matches:
+            self.proj_tpl_list.setCurrentItem(matches[0])
+        self.feedback_banner.set_feedback(f"✓ Saved project template '{name}'", "ok")
 
     def _capture_active_project(self) -> None:
         if not self.active_project_root or not self.active_project_root.is_dir():
-            QMessageBox.information(self, "Capture Project", "Open a project first to capture its hierarchy as a template.")
+            self.feedback_banner.set_feedback("Open a project first to capture its hierarchy as a template.", "warn")
             return
         name = self.pt_name_edit.text().strip() or f"{self.active_project_root.name}_tpl"
         self.tm.capture_template("project", self.active_project_root, name)
         self._refresh_all_lists()
+        self.feedback_banner.set_feedback(f"✓ Captured project template '{name}'", "ok")
 
-    def _delete_project_template(self) -> None:
+    def _delete_project_template(self, confirm: bool = True) -> None:
         name = self.pt_name_edit.text().strip()
-        if name:
-            self.tm.delete_project_template(name)
-            self._refresh_all_lists()
+        if not name:
+            return
+        if confirm and not confirm_destructive_action(
+            self,
+            "Delete Project Template",
+            f"Delete project template '{name}'?",
+            confirm_label="Delete Template",
+            informative_text="This cannot be undone.",
+        ):
+            return
+        self.tm.delete_project_template(name)
+        self._refresh_all_lists()
+        self.feedback_banner.set_feedback(f"Deleted project template '{name}'", "info")
 
     def _load_task_template(self, name: str) -> None:
         if not name:
@@ -2422,27 +2656,43 @@ class TemplateManagerDialog(QDialog):
         )
         self.tm.save_task_template(tt)
         self._refresh_all_lists()
+        matches = self.task_tpl_list.findItems(name, Qt.MatchFlag.MatchExactly)
+        if matches:
+            self.task_tpl_list.setCurrentItem(matches[0])
+        self.feedback_banner.set_feedback(f"✓ Saved component template '{name}'", "ok")
 
     def _capture_active_component(self) -> None:
         if not self.active_project_root or not self.active_component_path:
-            QMessageBox.information(self, "Capture Component", "Select a component in the main window first.")
+            self.feedback_banner.set_feedback("Select a component in the main window first.", "warn")
             return
         comp_dir = self.active_project_root / self.active_component_path
         name = self.tt_name_edit.text().strip() or f"{comp_dir.name}_task"
         self.tm.capture_template("task", comp_dir, name)
         self._refresh_all_lists()
+        self.feedback_banner.set_feedback(f"✓ Captured component template '{name}'", "ok")
 
-    def _delete_task_template(self) -> None:
+    def _delete_task_template(self, confirm: bool = True) -> None:
         name = self.tt_name_edit.text().strip()
-        if name:
-            self.tm.delete_task_template(name)
-            self._refresh_all_lists()
+        if not name:
+            return
+        if confirm and not confirm_destructive_action(
+            self,
+            "Delete Component Template",
+            f"Delete component template '{name}'?",
+            confirm_label="Delete Template",
+            informative_text="This cannot be undone.",
+        ):
+            return
+        self.tm.delete_task_template(name)
+        self._refresh_all_lists()
+        self.feedback_banner.set_feedback(f"Deleted component template '{name}'", "info")
 
     def _import_seed_file(self) -> None:
         file_str, _ = QFileDialog.getOpenFileName(self, "Select Starter Working File (.rpp, .blend, .kra, .psd, etc.)")
         if file_str:
             self.tm.import_seed_file(Path(file_str))
             self._refresh_all_lists()
+            self.feedback_banner.set_feedback(f"✓ Imported seed file '{Path(file_str).name}'", "ok")
 
     def _open_selected_seed_file(self) -> None:
         row = self.seed_files_table.currentRow()
@@ -2458,21 +2708,28 @@ class TemplateManagerDialog(QDialog):
             prof = self.hub.detect_software_for_extension(fpath.suffix)
             launch_file_with_profile(fpath, prof)
 
-    def _delete_selected_seed_file(self) -> None:
+    def _delete_selected_seed_file(self, confirm: bool = True) -> None:
         row = self.seed_files_table.currentRow()
         if row < 0:
             return
         name_item = self.seed_files_table.item(row, 0)
-        if name_item:
-            self.tm.delete_seed_file(name_item.text())
-            self._refresh_all_lists()
+        if not name_item:
+            return
+        fname = name_item.text()
+        if confirm and not confirm_destructive_action(
+            self,
+            "Delete Seed File",
+            f"Delete legacy seed file '{fname}'?",
+            confirm_label="Delete Seed File",
+            informative_text="This cannot be undone.",
+        ):
+            return
+        self.tm.delete_seed_file(fname)
+        self._refresh_all_lists()
+        self.feedback_banner.set_feedback(f"Deleted seed file '{fname}'", "info")
 
     def _open_templates_folder(self) -> None:
-        import os
-        import sys
-
-        if sys.platform == "win32" and hasattr(os, "startfile"):
-            os.startfile(str(self.tm.templates_root))
+        open_folder_in_os(self.tm.templates_root)
 
 
 class IngestWorkingDialog(QDialog):
@@ -2509,7 +2766,8 @@ class IngestWorkingDialog(QDialog):
         self.rename_chk = QCheckBox(f"Rename primary file to '{component_leaf}_v{next_version_num:03d}<ext>'")
         self.rename_chk.setChecked(True)
         self.copy_mode_combo = QComboBox()
-        self.copy_mode_combo.addItems(["copy", "move"])
+        self.copy_mode_combo.addItem("Copy (keep original)", "copy")
+        self.copy_mode_combo.addItem("Move (remove original)", "move")
         self.comment_edit = QLineEdit(f"Ingested {self.source_paths[0].name if len(self.source_paths) == 1 else f'{len(self.source_paths)} items'}")
         self.tags_edit = QLineEdit()
         self.tags_edit.setPlaceholderText("comma-separated tags (optional)")
@@ -2520,23 +2778,19 @@ class IngestWorkingDialog(QDialog):
         form.addRow("Tags:", self.tags_edit)
         layout.addLayout(form)
 
-        btns = QHBoxLayout()
-        btns.addStretch()
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
         ok_btn = QPushButton(f"Ingest as working/v{next_version_num:03d}/")
         ok_btn.setObjectName("PrimaryButton")
         ok_btn.setDefault(True)
         ok_btn.clicked.connect(self.accept)
-        btns.addWidget(cancel_btn)
-        btns.addWidget(ok_btn)
-        layout.addLayout(btns)
+        layout.addWidget(DialogFooter(self, cancel_button=cancel_btn, primary_button=ok_btn))
 
     def get_values(self) -> dict[str, object]:
         tags = [t.strip() for t in self.tags_edit.text().split(",") if t.strip()]
         return {
             "rename_to_convention": self.rename_chk.isChecked(),
-            "copy_mode": self.copy_mode_combo.currentText(),
+            "copy_mode": str(self.copy_mode_combo.currentData() or "copy"),
             "comment": self.comment_edit.text().strip(),
             "tags": tags,
         }
@@ -2612,6 +2866,8 @@ class PublishDeliverableDialog(QDialog):
 
         # Staging table (supports drag-and-drop)
         self.staging_table = DropTableWidget(0, 5)
+        self.staging_table.verticalHeader().setVisible(False)
+        self.staging_table.setAlternatingRowColors(True)
         self.staging_table.setHorizontalHeaderLabels(["Source File", "Type", "Output Label (optional)", "Target Filename", "Action"])
         self.staging_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.staging_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
@@ -2624,7 +2880,7 @@ class PublishDeliverableDialog(QDialog):
         layout.addWidget(self.staging_table, 1)
 
         stage_btns = QHBoxLayout()
-        add_files_btn = QPushButton("+ Add File(s)...")
+        add_files_btn = QPushButton("+ Add File(s)…")
         add_files_btn.clicked.connect(self._browse_add_files)
         self.keep_names_chk = QCheckBox("Keep original filenames")
         self.keep_names_chk.toggled.connect(self._refresh_target_previews)
@@ -2644,17 +2900,13 @@ class PublishDeliverableDialog(QDialog):
         bottom_form.addRow("Tags:", self.tags_edit)
         layout.addLayout(bottom_form)
 
-        btns = QHBoxLayout()
-        btns.addStretch()
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
         self.publish_btn = QPushButton("Publish Deliverables")
         self.publish_btn.setObjectName("PrimaryButton")
         self.publish_btn.setDefault(True)
         self.publish_btn.clicked.connect(self._validate_and_accept)
-        btns.addWidget(cancel_btn)
-        btns.addWidget(self.publish_btn)
-        layout.addLayout(btns)
+        layout.addWidget(DialogFooter(self, cancel_button=cancel_btn, primary_button=self.publish_btn))
 
         self.deliverable_combo.currentTextChanged.connect(self._refresh_target_version_combo)
         self.target_ver_combo.currentIndexChanged.connect(self._refresh_target_previews)

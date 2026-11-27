@@ -159,7 +159,7 @@ class ReaperSendTarget:
             return DCCSendResult(
                 False,
                 "REAPER Bridge is not currently running.\n\n"
-                "Open REAPER (with Obol Bridge installed via ⚙ Settings → DCC Integrations...), "
+                "Open REAPER (with Obol Bridge installed via Settings → DCC Integrations…), "
                 "or drag the file directly from this list into REAPER's Arrange view.",
                 offline_hint=True,
             )

@@ -56,6 +56,7 @@ class ProjectIndex:
                 category TEXT,
                 author TEXT,
                 source TEXT,
+                url TEXT,
                 license TEXT,
                 tags_json TEXT,
                 custom_json TEXT,
@@ -131,8 +132,8 @@ class ProjectIndex:
             conn.execute(
                 """
                 INSERT INTO repo_assets (
-                    component_path, asset_path, name, category, author, source, license, tags_json, custom_json, latest_version, used_by_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    component_path, asset_path, name, category, author, source, url, license, tags_json, custom_json, latest_version, used_by_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     cpath,
@@ -141,6 +142,7 @@ class ProjectIndex:
                     asset.category,
                     asset.author,
                     asset.source,
+                    asset.url,
                     asset.license,
                     json.dumps(asset.tags),
                     json.dumps(asset.custom),
@@ -193,9 +195,9 @@ class ProjectIndex:
                     sql = "SELECT * FROM repo_assets WHERE 1=1"
                     params: list[Any] = []
                     if query:
-                        sql += " AND (name LIKE ? OR asset_path LIKE ? OR tags_json LIKE ? OR source LIKE ?)"
+                        sql += " AND (name LIKE ? OR asset_path LIKE ? OR tags_json LIKE ? OR source LIKE ? OR url LIKE ? OR custom_json LIKE ?)"
                         q = f"%{query}%"
-                        params.extend([q, q, q, q])
+                        params.extend([q, q, q, q, q, q])
                     if author:
                         sql += " AND author LIKE ?"
                         params.append(f"%{author}%")

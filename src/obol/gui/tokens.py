@@ -1,0 +1,62 @@
+"""Centralized visual design tokens for the Obol PySide6 Desktop GUI."""
+
+from __future__ import annotations
+
+# Surfaces
+BG_WINDOW = "#0c0c0f"
+BG_CARD = "#131317"
+BG_WORKSPACE = "#17171c"
+BG_LIST = "#121216"
+BG_LIST_ALT = "#15151a"
+BG_INPUT = "#0e0e12"
+BG_INPUT_READONLY = "#141419"
+BG_BUTTON = "#1f1f26"
+BG_BUTTON_HOVER = "#272730"
+BG_SUBTLE = "#191920"
+BG_SELECTED = "#1d3566"
+BG_DRAG = "#142244"
+
+# Borders
+BORDER_SUBTLE = "#1f1f26"
+BORDER_DEFAULT = "#23232b"
+BORDER_CONTROL = "#2e2e38"
+BORDER_HOVER = "#464656"
+BORDER_FOCUS = "#60a5fa"
+
+# Text (WCAG AA compliant)
+TEXT_PRIMARY = "#f4f4f5"
+TEXT_SECONDARY = "#d4d4d8"
+TEXT_MUTED = "#9ca3af"
+TEXT_DISABLED = "#71717a"
+
+# Accents & Semantics
+ACCENT = "#2563eb"
+ACCENT_BORDER = "#3b82f6"
+ACCENT_HOVER = "#1d4ed8"
+ACCENT_LIGHT = "#93c5fd"
+
+SUCCESS = "#4ade80"
+SUCCESS_BG = "#0f3a22"
+SUCCESS_TEXT = "#bbf7d0"
+SUCCESS_BORDER = "#22c55e"
+
+WARNING = "#fbbf24"
+WARNING_BG = "#451a03"
+WARNING_TEXT = "#fde68a"
+WARNING_BORDER = "#f59e0b"
+
+ERROR = "#f87171"
+ERROR_BG = "#450a0a"
+ERROR_TEXT = "#fecaca"
+ERROR_BORDER = "#ef4444"
+
+INFO = "#93c5fd"
+
+DANGER_TEXT = "#fca5a5"
+DANGER_BORDER = "#4c1d1d"
+DANGER_BG_HOVER = "#991b1b"
+
+# Sizes
+ICON_SM = 14
+ICON_MD = 16
+ICON_BTN_SIZE = 28

@@ -545,8 +545,7 @@ class TestResolveIntegration(unittest.TestCase):
 
         win = ObolMainWindow(hub=self.hub, initial_project="gui_dvr", initial_component="finish")
         self.assertIn("Resolve:", win.resolve_status_pill.text())
-        self.assertFalse(win.resolve_export_btn.isHidden())
-        self.assertTrue(win.reaper_export_btn.isHidden())
+        self.assertIn("Resolve", win.dcc_export_btn.text())
         win.close()
 
 
