@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
-from PySide6.QtCore import QObject, QThread, Qt, QUrl, Signal
+from PySide6.QtCore import QObject, QThread, Qt, QUrl, Slot
 from PySide6.QtGui import QAction, QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -26,12 +26,21 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from shiboken6 import isValid as _qt_is_valid
 
 from obol.gui.icons import get_icon
 from obol.gui.theme import apply_studio_dark_theme
 from obol.gui.tokens import ICON_SM, TEXT_MUTED
 
 _ACTIVE_BUSY_WORKERS: list[tuple[QThread, QObject]] = []
+_QUIT_HOOKED_APP_IDS: set[int] = set()
+
+
+def _wait_for_active_busy_workers() -> None:
+    """Wait briefly for any in-flight busy threads before Qt tears down QApplication."""
+    for thread, _coordinator in list(_ACTIVE_BUSY_WORKERS):
+        if _qt_is_valid(thread) and thread.isRunning():
+            thread.wait(5000)
 
 
 def repolish(widget: QWidget) -> None:
@@ -149,20 +158,35 @@ def confirm_destructive_action(
     return box.clickedButton() is confirm_btn
 
 
-class _BusyWorker(QObject):
-    finished = Signal(object)
-    failed = Signal(object)
+class _BusyThread(QThread):
+    """Runs work_fn on a dedicated background thread and captures result or exception."""
 
     def __init__(self, work_fn: Callable[[], Any]) -> None:
         super().__init__()
         self._work_fn = work_fn
+        self.result: Any = None
+        self.error: Optional[Exception] = None
+        self.succeeded: bool = False
 
     def run(self) -> None:
         try:
-            res = self._work_fn()
-            self.finished.emit(res)
+            self.result = self._work_fn()
+            self.succeeded = True
         except Exception as exc:  # noqa: BLE001
-            self.failed.emit(exc)
+            self.error = exc
+            self.succeeded = False
+
+
+class _BusyCoordinator(QObject):
+    """Main-thread QObject receiver ensuring worker completion callbacks run on the GUI thread."""
+
+    def __init__(self, on_complete: Callable[[], None]) -> None:
+        super().__init__()
+        self._on_complete = on_complete
+
+    @Slot()
+    def handle_thread_finished(self) -> None:
+        self._on_complete()
 
 
 def run_with_busy_state(
@@ -181,7 +205,8 @@ def run_with_busy_state(
 
     def _set_disabled(disabled: bool) -> None:
         for w, was_enabled in prev_states:
-            w.setEnabled(False if disabled else was_enabled)
+            if _qt_is_valid(w):
+                w.setEnabled(False if disabled else was_enabled)
 
     if status_callback is not None and busy_message:
         status_callback(busy_message)
@@ -201,39 +226,53 @@ def run_with_busy_state(
             on_success(result)
         return result
 
+    app_id = id(app)
+    if app_id not in _QUIT_HOOKED_APP_IDS:
+        _QUIT_HOOKED_APP_IDS.add(app_id)
+        app.aboutToQuit.connect(_wait_for_active_busy_workers)
+
     _set_disabled(True)
     QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
-    thread = QThread(parent)
-    worker = _BusyWorker(work_fn)
-    worker.moveToThread(thread)
-    pair = (thread, worker)
-    _ACTIVE_BUSY_WORKERS.append(pair)
+    thread = _BusyThread(work_fn)
+    pair: list[tuple[QThread, QObject]] = []
 
-    def _cleanup() -> None:
+    def _on_thread_finished() -> None:
+        if _qt_is_valid(thread):
+            thread.wait()
         QApplication.restoreOverrideCursor()
         _set_disabled(False)
-        if pair in _ACTIVE_BUSY_WORKERS:
-            _ACTIVE_BUSY_WORKERS.remove(pair)
-        thread.quit()
-        worker.deleteLater()
-        thread.deleteLater()
+        if pair and pair[0] in _ACTIVE_BUSY_WORKERS:
+            _ACTIVE_BUSY_WORKERS.remove(pair[0])
 
-    def _handle_ok(res: Any) -> None:
-        _cleanup()
-        if on_success is not None:
-            on_success(res)
+        succeeded = thread.succeeded
+        result = thread.result
+        error = thread.error
 
-    def _handle_err(exc: Exception) -> None:
-        _cleanup()
-        if on_error is not None:
-            on_error(exc)
-        else:
-            QMessageBox.warning(parent, "Operation Failed", str(exc))
+        try:
+            if parent is not None and not _qt_is_valid(parent):
+                return
+            if succeeded:
+                if on_success is not None:
+                    on_success(result)
+            else:
+                exc = error if error is not None else RuntimeError("Operation failed.")
+                if on_error is not None:
+                    on_error(exc)
+                else:
+                    QMessageBox.warning(parent, "Operation Failed", str(exc))
+        finally:
+            if _qt_is_valid(thread):
+                thread.deleteLater()
+            if pair and _qt_is_valid(pair[0][1]):
+                pair[0][1].deleteLater()
 
-    thread.started.connect(worker.run)
-    worker.finished.connect(_handle_ok)
-    worker.failed.connect(_handle_err)
+    coordinator = _BusyCoordinator(_on_thread_finished)
+    entry = (thread, coordinator)
+    pair.append(entry)
+    _ACTIVE_BUSY_WORKERS.append(entry)
+
+    thread.finished.connect(coordinator.handle_thread_finished, Qt.ConnectionType.QueuedConnection)
     thread.start()
     return None
 

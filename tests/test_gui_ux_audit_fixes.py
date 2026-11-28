@@ -4,22 +4,30 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QMimeData, QPointF, QSize, Qt, QUrl
+from PySide6.QtCore import QCoreApplication, QEvent, QEventLoop, QMimeData, QPointF, QSize, Qt, QThread, QTimer, QUrl
 from PySide6.QtGui import QCloseEvent, QDropEvent, QIcon
-from PySide6.QtWidgets import QApplication, QTreeWidgetItem
+from PySide6.QtWidgets import QApplication, QDialog, QPushButton, QTreeWidgetItem, QWidget
+from shiboken6 import isValid as qt_is_valid
 
 from obol.core.hub import ObolHub
 from obol.core.storage import load_component_snapshot
 from obol.core.workspace import ObolWorkspace
 from obol.gui import tokens
 from obol.gui.app import ObolMainWindow
-from obol.gui.components import InlineStatusBanner, ShortcutsDialog, open_folder_in_os
+from obol.gui.components import (
+    _ACTIVE_BUSY_WORKERS,
+    InlineStatusBanner,
+    ShortcutsDialog,
+    open_folder_in_os,
+    run_with_busy_state,
+)
 from obol.gui.dialogs import (
     IngestWorkingDialog,
     PublishDeliverableDialog,
@@ -390,6 +398,152 @@ class TestGuiUxAuditFixes(unittest.TestCase):
             exp_dlg.close()
             exp_dlg.deleteLater()
             self.app.processEvents()
+
+    def test_run_with_busy_state_threaded_main_thread_and_lifecycle(self) -> None:
+        main_thread = self.app.thread()
+
+        def _wait_until(cond, timeout_ms: int = 5000) -> None:
+            loop = QEventLoop()
+            timed_out = False
+
+            def _poll() -> None:
+                if cond():
+                    loop.quit()
+
+            def _on_timeout() -> None:
+                nonlocal timed_out
+                timed_out = True
+                loop.quit()
+
+            poll_timer = QTimer()
+            poll_timer.setInterval(15)
+            poll_timer.timeout.connect(_poll)
+            poll_timer.start()
+
+            timeout_timer = QTimer()
+            timeout_timer.setSingleShot(True)
+            timeout_timer.timeout.connect(_on_timeout)
+            timeout_timer.start(timeout_ms)
+
+            if not cond():
+                loop.exec()
+            poll_timer.stop()
+            timeout_timer.stop()
+            self.assertFalse(timed_out, "Timed out waiting for busy worker completion")
+
+        with patch.object(self.app, "platformName", return_value="windows"):
+            # 1. Success path: work runs off main thread, on_success runs on main thread & can parent widgets
+            parent = QWidget()
+            btn = QPushButton("Sync", parent)
+            work_threads: list[bool] = []
+            cb_threads: list[bool] = []
+            results: list[object] = []
+            done_flag = [False]
+
+            def _work_ok() -> str:
+                work_threads.append(QThread.currentThread() is main_thread)
+                return "ok_payload"
+
+            def _on_ok(res: object) -> None:
+                cb_threads.append(QThread.currentThread() is main_thread)
+                child = QPushButton("child", parent)
+                self.assertIs(child.parent(), parent)
+                results.append(res)
+                done_flag[0] = True
+
+            run_with_busy_state(parent, _work_ok, on_success=_on_ok, disable_widgets=[btn])
+            _wait_until(lambda: done_flag[0] and not _ACTIVE_BUSY_WORKERS)
+            self.app.processEvents()
+            self.assertEqual(work_threads, [False])
+            self.assertEqual(cb_threads, [True])
+            self.assertEqual(results, ["ok_payload"])
+            self.assertTrue(btn.isEnabled())
+            self.assertIsNone(QApplication.overrideCursor())
+            self.assertEqual(_ACTIVE_BUSY_WORKERS, [])
+            parent.close()
+            parent.deleteLater()
+            self.app.processEvents()
+
+            # 2. Error path: exception delivered to on_error on main thread
+            err_parent = QWidget()
+            err_btn = QPushButton("Err", err_parent)
+            err_threads: list[bool] = []
+            err_msgs: list[str] = []
+            err_done = [False]
+
+            def _work_fail() -> None:
+                raise RuntimeError("boom")
+
+            def _on_err(exc: Exception) -> None:
+                err_threads.append(QThread.currentThread() is main_thread)
+                err_msgs.append(str(exc))
+                err_done[0] = True
+
+            run_with_busy_state(err_parent, _work_fail, on_error=_on_err, disable_widgets=[err_btn])
+            _wait_until(lambda: err_done[0] and not _ACTIVE_BUSY_WORKERS)
+            self.app.processEvents()
+            self.assertEqual(err_threads, [True])
+            self.assertEqual(err_msgs, ["boom"])
+            self.assertTrue(err_btn.isEnabled())
+            self.assertIsNone(QApplication.overrideCursor())
+            self.assertEqual(_ACTIVE_BUSY_WORKERS, [])
+            err_parent.close()
+            err_parent.deleteLater()
+            self.app.processEvents()
+
+            # 3. Real ObolMainWindow._action_refresh_and_reconcile() (Sync button)
+            sync_proj_root = self.ws.init_project("sync_proj", self.root / "sync_proj", project_template="single_track")
+            win = ObolMainWindow(hub=self.hub, initial_project="sync_proj")
+            try:
+                comp = win.active_component_path
+                ext_dir = sync_proj_root / comp / "working" / "v002"
+                ext_dir.mkdir(parents=True, exist_ok=True)
+                (ext_dir / "ext_sync.rpp").write_text("<REAPER_PROJECT\n>\n", encoding="utf-8")
+
+                win._action_refresh_and_reconcile()
+                _wait_until(lambda: win.refresh_btn.isEnabled() and not _ACTIVE_BUSY_WORKERS)
+                self.app.processEvents()
+                self.assertTrue(win.refresh_btn.isEnabled())
+                self.assertIn("Synced & refreshed from disk", win.status_feedback_label.text())
+                self.assertIsNone(QApplication.overrideCursor())
+                self.assertEqual(_ACTIVE_BUSY_WORKERS, [])
+                snap = load_component_snapshot(sync_proj_root, comp)
+                self.assertEqual([w.version for w in snap.working_versions], [1, 2])
+            finally:
+                win.close()
+                win.deleteLater()
+                self.app.processEvents()
+
+            # 4. Destroyed parent dialog while background thread is still running
+            dlg = QDialog()
+            started_evt = threading.Event()
+            release_evt = threading.Event()
+            cb_called = [False]
+
+            def _blocking_work() -> str:
+                started_evt.set()
+                release_evt.wait(timeout=4.0)
+                return "finished_after_close"
+
+            def _never_called(_res: object) -> None:
+                cb_called[0] = True
+
+            try:
+                run_with_busy_state(dlg, _blocking_work, on_success=_never_called)
+                self.assertTrue(started_evt.wait(timeout=2.0))
+                dlg.close()
+                dlg.deleteLater()
+                QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                self.app.processEvents()
+                self.assertFalse(qt_is_valid(dlg))
+            finally:
+                release_evt.set()
+
+            _wait_until(lambda: not _ACTIVE_BUSY_WORKERS)
+            self.app.processEvents()
+            self.assertFalse(cb_called[0])
+            self.assertIsNone(QApplication.overrideCursor())
+            self.assertEqual(_ACTIVE_BUSY_WORKERS, [])
 
 
 if __name__ == "__main__":

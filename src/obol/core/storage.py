@@ -554,3 +554,11 @@ class Reconciler:
         snapshot.published_versions.sort(key=lambda x: x.version)
         save_component_snapshot(project_root, snapshot)
         return snapshot
+
+    @classmethod
+    def reconcile_project(cls, project_root: Path) -> list[ComponentSnapshot]:
+        """Reconciles every discovered component under project_root against disk and ledger events."""
+        return [
+            cls.reconcile_component(project_root, comp)
+            for comp in discover_project_components(project_root)
+        ]
