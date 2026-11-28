@@ -497,7 +497,10 @@ class TestDCCMediaManager(unittest.TestCase):
             target_file=fcproj,
             include_external=True,
         )
-        with patch.object(f_bridge, "resolve_cli_executable", return_value=None):
+        with (
+            patch.object(f_bridge, "resolve_cli_executable", return_value=None),
+            patch.object(f_bridge, "is_live_bridge_listening", return_value=False),
+        ):
             scan = reg.scan("filmcraft", ctx)
             self.assertEqual(scan.total_count, 2)
             self.assertEqual(scan.external_count, 1)
@@ -514,6 +517,45 @@ class TestDCCMediaManager(unittest.TestCase):
         items_after = FilmCraftPlugin.extract_media_items(fcproj)
         cut_after = next(it for it in items_after if it["id"] == 2)
         self.assertEqual(cut_after["raw_path"], "../../repo/video/cut/v002/cut_v002.mp4")
+
+    def test_filmcraft_live_list_media_items_paths(self) -> None:
+        proj = self.ws.init_project("fc_live_list", self.root / "fc_live_list", custom_components=[])
+        self.ws.create_component(proj, "edit", task_template="filmcraft_video")
+        fcproj = (proj / "edit" / "working" / "v001" / "edit_v001.fcproj").resolve()
+        clip_vers = self._seed_asset_versions(proj, "edit", "video/cut", ext=".mp4", count=2)
+        rel_v1 = os.path.relpath(clip_vers[0], fcproj.parent).replace("\\", "/")
+
+        data = json.loads(fcproj.read_text(encoding="utf-8"))
+        data["project"]["root"]["children"] = [{"Bin": {"id": 1, "name": "Edit", "children": [{"Item": 2}]}}]
+        data["project"]["items"] = {
+            "2": {
+                "id": 2,
+                "name": clip_vers[0].name,
+                "kind": {"Media": {"media": {"File": {"path": rel_v1}}}},
+            }
+        }
+        fcproj.write_text(json.dumps(data), encoding="utf-8")
+
+        f_bridge = FilmCraftBridgeClient(self.hub)
+        # 1. Real inspect_project shape (has "path", no "items") -> falls back to extract_media_items
+        with patch.object(
+            f_bridge,
+            "inspect_project",
+            return_value={"name": "edit_v001", "path": str(fcproj), "root": data["project"]["root"]},
+        ):
+            items_fallback = f_bridge.list_media_items(project_path=None, use_bridge=True)
+            self.assertEqual(len(items_fallback), 1)
+            self.assertEqual(Path(items_fallback[0]["file_path"]).resolve(), clip_vers[0])
+
+        # 2. Live inspect_project shape containing "items" with relative path -> resolves against path parent
+        with patch.object(
+            f_bridge,
+            "inspect_project",
+            return_value={"name": "edit_v001", "path": str(fcproj), "items": data["project"]["items"]},
+        ):
+            items_direct = f_bridge.list_media_items(project_path=None, use_bridge=True)
+            self.assertEqual(len(items_direct), 1)
+            self.assertEqual(Path(items_direct[0]["file_path"]).resolve(), clip_vers[0])
 
     def test_custom_plugin_media_adapter_discovery(self) -> None:
         plugin_file = self.hub.plugins_dir / "custom_media_ext.py"
@@ -655,7 +697,10 @@ class TestDCCMediaManager(unittest.TestCase):
         fcproj.write_text(json.dumps(fc_data), encoding="utf-8")
 
         f_bridge = FilmCraftBridgeClient(self.hub)
-        with patch.object(f_bridge, "resolve_cli_executable", return_value=None):
+        with (
+            patch.object(f_bridge, "resolve_cli_executable", return_value=None),
+            patch.object(f_bridge, "is_live_bridge_listening", return_value=False),
+        ):
             d_fc = FilmCraftImportDialog(
                 None,
                 self.hub,

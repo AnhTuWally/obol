@@ -531,6 +531,7 @@ class FilmCraftBridgeClient:
         target = project_path
         if target is None:
             insp = self.inspect_project(use_bridge=use_bridge)
+            items_node = insp.get("items")
             raw_p = str(insp.get("path") or "").strip()
             proj_dir = Path(raw_p).parent.resolve() if raw_p else None
             if isinstance(items_node, dict) and items_node:
