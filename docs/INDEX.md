@@ -73,6 +73,7 @@ d:\tu_tools\obol\
 │       │   ├── filmcraft_bridge.py       # Dual-mode FilmCraft client (TCP --control bridge + headless CLI)
 │       │   ├── filmcraft_installer.py    # FilmCraft bridge config & --control launcher installer
 │       │   ├── integrations.py           # Unified DCCIntegrationManager & config-drift diagnostics
+│       │   ├── media_registry.py         # Unified DCCMediaRegistry, loaded-media scan & version up/down
 │       │   ├── send_registry.py          # Unified DCCSendRegistry, target ranking & built-in send adapters
 │       │   └── blender.py                # Blender 3D (.blend) plugin
 │       ├── cli/
@@ -82,6 +83,7 @@ d:\tu_tools\obol\
 │           ├── drop_widgets.py           # OS drag-and-drop / drag-out widgets & tab hover switcher
 │           ├── dialogs.py                # Project/Vault, Create Project, Template, Software, Ingest & Publish modals
 │           ├── integrations_dialog.py    # Unified Master-Detail DCC Integrations Manager dialog
+│           ├── media_manager_dialog.py   # Unified DCC Media Manager dialog (list, update check, version up/down)
 │           ├── reaper_dialogs.py         # Focused REAPER companion dialogs (Open, Import/Update, Export, Setup)
 │           ├── resolve_dialogs.py        # Focused DaVinci Resolve dialogs (Media Pool Load/Update, Export, Setup)
 │           ├── filmcraft_dialogs.py      # Focused FilmCraft dialogs (Import/Update, Export/Publish, Setup)
@@ -95,6 +97,7 @@ d:\tu_tools\obol\
     ├── test_resolve_integration.py       # DaVinci Resolve dual-mode bridge, Lua installer, CLI & dialogs
     ├── test_filmcraft_integration.py     # FilmCraft dual-mode bridge, headless CLI, dialogs & relinking
     ├── test_integrations_manager.py      # Unified DCC integration manager, drift detection & UI smoke
+    ├── test_dcc_media_manager.py         # Unified DCCMediaRegistry, loaded media scan & version up/down
     ├── test_dcc_send_registry.py         # Unified DCCSendRegistry, target ranking & DCC Exchange Bar UI
     ├── test_templates.py                 # 3-tier template preview, CRUD & capture
     ├── test_seed_templates.py            # Scoped & versioned seed template cascade, pinning & CLI/GUI

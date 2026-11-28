@@ -69,6 +69,7 @@ from obol.gui.drop_widgets import DropTreeWidget, install_tab_hover_switch
 from obol.gui.filmcraft_dialogs import FilmCraftExportPublishDialog, FilmCraftImportDialog
 from obol.gui.icons import get_icon
 from obol.gui.integrations_dialog import IntegrationsManagerDialog
+from obol.gui.media_manager_dialog import DCCMediaManagerDialog
 from obol.gui.metadata_widgets import CustomMetadataEditor
 from obol.gui.reaper_dialogs import ReaperExportPublishDialog, ReaperImportDialog
 from obol.gui.resolve_dialogs import ResolveExportPublishDialog
@@ -86,6 +87,7 @@ from obol.gui.tokens import (
 from obol.plugins.filmcraft_bridge import FilmCraftBridgeClient
 from obol.plugins.filmcraft_installer import FilmCraftInstaller
 from obol.plugins.integrations import DCCIntegrationManager
+from obol.plugins.media_registry import DCCMediaRegistry
 from obol.plugins.reaper_bridge import ReaperBridgeClient
 from obol.plugins.reaper_installer import ReaperInstaller
 from obol.plugins.resolve_bridge import ResolveBridgeClient
@@ -136,6 +138,13 @@ class ObolMainWindow(QMainWindow):
         self.filmcraft_installer = FilmCraftInstaller(self.hub)
         self.integration_manager = DCCIntegrationManager(self.hub, allow_resolve_studio_api=allow_studio)
         self.send_registry = DCCSendRegistry(
+            self.hub,
+            reaper_bridge=self.reaper_bridge,
+            resolve_bridge=self.resolve_bridge,
+            filmcraft_bridge=self.filmcraft_bridge,
+            allow_resolve_studio_api=allow_studio,
+        )
+        self.media_registry = DCCMediaRegistry(
             self.hub,
             reaper_bridge=self.reaper_bridge,
             resolve_bridge=self.resolve_bridge,
@@ -706,6 +715,15 @@ class ObolMainWindow(QMainWindow):
         self.dcc_send_btn.clicked.connect(self._action_send_selected_to_active_dcc)
         dcc_bar_layout.addWidget(self.dcc_send_btn, 2)
 
+        self.dcc_media_btn = QPushButton("Media…")
+        self.dcc_media_btn.setIcon(get_icon("layers", TEXT_SECONDARY, ICON_SM))
+        self.dcc_media_btn.setIconSize(QSize(ICON_SM, ICON_SM))
+        self.dcc_media_btn.setToolTip(
+            "Inspect loaded media in the target DCC, check for updates, and version up or down (Ctrl+M)"
+        )
+        self.dcc_media_btn.clicked.connect(lambda: self._action_open_dcc_media_manager())
+        dcc_bar_layout.addWidget(self.dcc_media_btn, 1)
+
         self.dcc_export_btn = QPushButton("Export…")
         self.dcc_export_btn.setIcon(get_icon("dcc_pull", TEXT_SECONDARY, ICON_SM))
         self.dcc_export_btn.setIconSize(QSize(ICON_SM, ICON_SM))
@@ -1220,6 +1238,7 @@ class ObolMainWindow(QMainWindow):
         QShortcut(QKeySequence("Ctrl+I"), self, activated=self._action_context_ingest)
         QShortcut(QKeySequence("Ctrl+P"), self, activated=self._action_publish_deliverable)
         QShortcut(QKeySequence("Ctrl+D"), self, activated=self._action_send_selected_to_active_dcc)
+        QShortcut(QKeySequence("Ctrl+M"), self, activated=lambda: self._action_open_dcc_media_manager())
         QShortcut(QKeySequence("Ctrl+S"), self, activated=lambda: self._save_inspector_metadata(silent_refresh=False))
         QShortcut(QKeySequence("Ctrl+Shift+C"), self, activated=self._action_copy_metadata)
         QShortcut(QKeySequence("Ctrl+Shift+V"), self, activated=lambda: self._action_paste_metadata(merge=False))
@@ -3669,12 +3688,27 @@ class ObolMainWindow(QMainWindow):
                 "Open a live DCC or pick a DCC in the dropdown to send Repo/Published media (Ctrl+D)"
             )
 
-        # Update Export button
+        # Update Media Manager & Export buttons
         export_key = self._resolve_export_dcc_key(active)
+        label_map = {"reaper": "REAPER", "resolve": "Resolve", "filmcraft": "FilmCraft"}
+        if hasattr(self, "dcc_media_btn"):
+            self.dcc_media_btn.setEnabled(self.active_project_root is not None or active is not None)
+            self.dcc_media_btn.setIcon(get_icon("layers", TEXT_SECONDARY, ICON_SM))
+            if export_key:
+                media_label = label_map.get(export_key) or (active.target.display_name if active else export_key.title())
+                self.dcc_media_btn.setText(f"Media ({media_label})…")
+                self.dcc_media_btn.setToolTip(
+                    f"Inspect loaded media in {media_label}, check for updates, and version up or down (Ctrl+M)"
+                )
+            else:
+                self.dcc_media_btn.setText("Media…")
+                self.dcc_media_btn.setToolTip(
+                    "Inspect loaded media in a DCC, check for updates, and version up or down (Ctrl+M)"
+                )
+
         self.dcc_export_btn.setEnabled(self.active_snapshot is not None)
         self.dcc_export_btn.setIcon(get_icon("dcc_pull", TEXT_SECONDARY, ICON_SM))
         if export_key:
-            label_map = {"reaper": "REAPER", "resolve": "Resolve", "filmcraft": "FilmCraft"}
             exp_label = label_map.get(export_key) or (active.target.display_name if active else export_key.title())
             self.dcc_export_btn.setText(f"Export ({exp_label})…")
             self.dcc_export_btn.setToolTip(f"Export / render & publish directly from {exp_label}")
@@ -3758,6 +3792,40 @@ class ObolMainWindow(QMainWindow):
     def _action_refresh_dcc_targets(self) -> None:
         self._refresh_reaper_status_pill()
         self.show_status_message("✓ Refreshed DCC status")
+
+    def _action_open_dcc_media_manager(self, initial_dcc: str = "") -> None:
+        if self._cached_dcc_targets is None:
+            self._cached_dcc_targets = self.send_registry.resolve_targets(self._make_dcc_send_context())
+        active = self._cached_dcc_targets[0]
+        dcc_key = initial_dcc or self._resolve_export_dcc_key(active) or "reaper"
+        target_file: Optional[Path] = None
+        if dcc_key == "reaper" and not self.reaper_bridge.is_connected():
+            if self.active_project_root and self.active_component_path and self.active_snapshot:
+                ver = self._selected_working_version()
+                bundle = (
+                    next((v for v in self.active_snapshot.working_versions if v.version == ver), None)
+                    if ver is not None
+                    else (self.active_snapshot.working_versions[-1] if self.active_snapshot.working_versions else None)
+                )
+                if bundle and bundle.primary_file:
+                    cand = (self.active_project_root / self.active_component_path / bundle.primary_file).resolve()
+                    if cand.suffix.lower() == ".rpp" and cand.is_file():
+                        target_file = cand
+        elif dcc_key == "filmcraft" and not self.filmcraft_bridge.is_live_bridge_listening(timeout_s=0.05):
+            target_file = self._active_working_fcproj(fallback_any_component=True)
+
+        dlg = DCCMediaManagerDialog(
+            self,
+            self.hub,
+            self.workspace,
+            self.media_registry,
+            initial_dcc=dcc_key,
+            project_root=self.active_project_root,
+            project_name=self.active_project_name,
+            component_path=self.active_component_path,
+            target_file=target_file,
+        )
+        dlg.exec()
 
     def _action_import_files_into_reaper(self, paths: list[Path], mode: str = "new_track") -> None:
         self._dispatch_send_to_dcc("reaper", paths, mode_id=mode)

@@ -532,6 +532,46 @@ class FilmCraftBridgeClient:
         if target is None:
             insp = self.inspect_project(use_bridge=use_bridge)
             raw_p = str(insp.get("path") or "").strip()
+            proj_dir = Path(raw_p).parent.resolve() if raw_p else None
+            if isinstance(items_node, dict) and items_node:
+                extracted: list[dict[str, Any]] = []
+                for item_id_str, item in items_node.items():
+                    if not isinstance(item, dict):
+                        continue
+                    media_kind = item.get("kind", {}).get("Media") if isinstance(item.get("kind"), dict) else None
+                    if not isinstance(media_kind, dict):
+                        continue
+                    media_node = media_kind.get("media")
+                    if not isinstance(media_node, dict):
+                        continue
+                    raw_path = ""
+                    if isinstance(media_node.get("File"), dict):
+                        raw_path = str(media_node["File"].get("path") or "")
+                    elif isinstance(media_node.get("ImageSequence"), dict):
+                        seq = media_node["ImageSequence"]
+                        raw_path = str(seq.get("path") or seq.get("first_file") or "")
+                    if not raw_path:
+                        continue
+                    try:
+                        numeric_id = int(item.get("id", item_id_str))
+                    except (TypeError, ValueError):
+                        continue
+                    p = Path(raw_path)
+                    if not p.is_absolute() and proj_dir is not None:
+                        resolved_str = str((proj_dir / p).resolve()).replace("\\", "/")
+                    else:
+                        resolved_str = raw_path.replace("\\", "/")
+                    extracted.append({
+                        "id": numeric_id,
+                        "name": str(item.get("name") or Path(raw_path).name),
+                        "raw_path": raw_path,
+                        "file_path": resolved_str,
+                        "bin_path": str(item.get("bin_path") or "Root"),
+                        "offline": bool(media_kind.get("offline", False)),
+                        "type": "Media",
+                    })
+                if extracted:
+                    return extracted
             if raw_p:
                 target = Path(raw_p)
         if target is not None and Path(target).is_file():
@@ -647,6 +687,25 @@ class FilmCraftBridgeClient:
         if not replacements:
             return {"replaced": 0}
         save_flag = project_path is not None and use_bridge is not True
+        cli = self.resolve_cli_executable()
+        if use_bridge is not True and project_path is not None and (cli is None or not cli.is_file()):
+            proj_resolved = Path(project_path).resolve()
+            if not proj_resolved.is_file():
+                raise FileNotFoundError(f"FilmCraft project file not found: {proj_resolved}")
+            items = FilmCraftPlugin.extract_media_items(proj_resolved)
+            by_id = {int(it["id"]): str(it["raw_path"]) for it in items if "id" in it and it.get("raw_path")}
+            raw_ref_map: dict[str, Path] = {}
+            for item_id, new_path in replacements.items():
+                raw_ref = by_id.get(int(item_id))
+                if raw_ref:
+                    raw_ref_map[raw_ref] = Path(new_path).resolve()
+            replaced = FilmCraftPlugin.relink_fcproj_references(
+                proj_resolved,
+                raw_ref_map,
+                relative=keep_relative,
+            )
+            return {"replaced": replaced, "mode": "offline_json"}
+
         replaced = 0
         relink_rel_map: dict[str, Path] = {}
 

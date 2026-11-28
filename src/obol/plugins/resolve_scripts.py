@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from obol.plugins.reaper_scripts import _lua_long_str
 
-OBOL_INTEGRATION_VERSION = "1.1"
+OBOL_INTEGRATION_VERSION = "1.2"
 
 
 def render_resolve_config_lua(
@@ -418,11 +418,24 @@ function M.walk_media_pool(folder, prefix, out_list)
         local okm, mval = pcall(function() return clip:GetMediaId() end)
         if okm and mval then mid = tostring(mval) end
       end
+      local obol_meta = {}
+      if clip.GetThirdPartyMetadata then
+        local ok_tp, tp = pcall(function() return clip:GetThirdPartyMetadata() end)
+        if ok_tp and type(tp) == "table" then
+          for mk, mv in pairs(tp) do
+            local sk = tostring(mk)
+            if sk:sub(1, 5) == "obol_" then
+              obol_meta[sk:sub(6)] = mv
+            end
+          end
+        end
+      end
       out_list[#out_list + 1] = {
         name = clip:GetName() or "",
         file_path = M.norm_sep(fpath),
         bin_path = curr,
         media_id = mid,
+        obol_meta = obol_meta,
       }
     end
   end
@@ -509,12 +522,15 @@ function M.exec_import_media(res, params)
   end
 
   local clips = mp:ImportMedia(paths) or {}
-  if type(params.asset_meta) == "table" and next(params.asset_meta) ~= nil then
-    local meta = {}
-    for k, v in pairs(params.asset_meta) do
-      meta["obol_" .. tostring(k)] = tostring(v)
-    end
-    for _, clip in pairs(clips) do
+  local metas = params.asset_metas or {}
+  local shared_meta = type(params.asset_meta) == "table" and params.asset_meta or nil
+  for idx, clip in pairs(clips) do
+    local src_meta = (type(metas[idx]) == "table" and metas[idx]) or shared_meta
+    if type(src_meta) == "table" and next(src_meta) ~= nil then
+      local meta = {}
+      for k, v in pairs(src_meta) do
+        meta["obol_" .. tostring(k)] = tostring(v)
+      end
       pcall(function() clip:SetThirdPartyMetadata(meta) end)
     end
   end
@@ -539,29 +555,42 @@ function M.exec_query_media_pool(res)
   return { items = items }
 end
 
-local function walk_replace_clips(folder, rep_map, state)
+local function walk_replace_clips(folder, rep_map, by_media_id, by_old_path, state)
   local clips = folder:GetClipList() or {}
   for _, clip in pairs(clips) do
     local okp, fpath = pcall(function() return clip:GetClipProperty("File Path") end)
-    if okp and fpath then
-      local target = rep_map[M.norm_key(fpath)]
-      if target and target ~= "" then
-        local ok_rep = false
-        if clip.ReplaceClipPreserveSubClip then
-          local ok1, r1 = pcall(function() return clip:ReplaceClipPreserveSubClip(target) end)
-          ok_rep = ok1 and r1
+    local mid = ""
+    if clip.GetMediaId then
+      local okm, mval = pcall(function() return clip:GetMediaId() end)
+      if okm and mval then mid = tostring(mval) end
+    end
+    local upd = (mid ~= "" and by_media_id[mid]) or (okp and fpath and by_old_path[M.norm_key(fpath)]) or nil
+    local target = (upd and upd.target_path) or (okp and fpath and rep_map[M.norm_key(fpath)]) or nil
+    if target and target ~= "" then
+      local ok_rep = false
+      if clip.ReplaceClipPreserveSubClip then
+        local ok1, r1 = pcall(function() return clip:ReplaceClipPreserveSubClip(target) end)
+        ok_rep = ok1 and r1
+      end
+      if not ok_rep and clip.ReplaceClip then
+        local ok2, r2 = pcall(function() return clip:ReplaceClip(target) end)
+        ok_rep = ok2 and r2
+      end
+      if ok_rep then
+        state.replaced = state.replaced + 1
+        if upd and type(upd.asset_meta) == "table" and next(upd.asset_meta) ~= nil and clip.SetThirdPartyMetadata then
+          local meta = {}
+          for k, v in pairs(upd.asset_meta) do
+            meta["obol_" .. tostring(k)] = tostring(v)
+          end
+          pcall(function() clip:SetThirdPartyMetadata(meta) end)
         end
-        if not ok_rep and clip.ReplaceClip then
-          local ok2, r2 = pcall(function() return clip:ReplaceClip(target) end)
-          ok_rep = ok2 and r2
-        end
-        if ok_rep then state.replaced = state.replaced + 1 end
       end
     end
   end
   local subs = folder:GetSubFolderList() or {}
   for _, sub in pairs(subs) do
-    walk_replace_clips(sub, rep_map, state)
+    walk_replace_clips(sub, rep_map, by_media_id, by_old_path, state)
   end
 end
 
@@ -574,8 +603,20 @@ function M.exec_replace_clips(res, params)
   for k, v in pairs(params.replacements or {}) do
     rep_map[M.norm_key(k)] = v
   end
+  local by_media_id = {}
+  local by_old_path = {}
+  for _, upd in ipairs(params.clip_updates or {}) do
+    if type(upd) == "table" and upd.target_path and upd.target_path ~= "" then
+      if upd.media_id and upd.media_id ~= "" then
+        by_media_id[tostring(upd.media_id)] = upd
+      end
+      if upd.old_path and upd.old_path ~= "" then
+        by_old_path[M.norm_key(upd.old_path)] = upd
+      end
+    end
+  end
   local state = { replaced = 0 }
-  walk_replace_clips(mp:GetRootFolder(), rep_map, state)
+  walk_replace_clips(mp:GetRootFolder(), rep_map, by_media_id, by_old_path, state)
   return { replaced = state.replaced }
 end
 

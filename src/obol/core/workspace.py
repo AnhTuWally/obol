@@ -1784,6 +1784,58 @@ class ObolWorkspace:
                 return cand
         return None
 
+    def _project_display_name(self, project_root: Path) -> str:
+        proj_resolved = project_root.resolve()
+        for entry in self.hub.list_projects():
+            try:
+                if Path(entry.local_path).expanduser().resolve() == proj_resolved and entry.name:
+                    return entry.name
+            except OSError:
+                continue
+        proj_toml = proj_resolved / ".obol" / "project.toml"
+        if proj_toml.is_file():
+            raw = load_toml_with_fallback(proj_toml)
+            if isinstance(raw, dict) and raw.get("name"):
+                return str(raw["name"])
+        return proj_resolved.name
+
+    def resolve_media_file_across_projects(
+        self,
+        media_file_path: Path,
+        preferred_project_root: Optional[Path] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Resolves a media file path across preferred, enclosing, and all registered Obol projects."""
+        media_resolved = Path(media_file_path).expanduser().resolve()
+        candidate_roots: list[Path] = []
+        seen_roots: set[Path] = set()
+
+        def _add_root(root: Optional[Path]) -> None:
+            if root is None:
+                return
+            try:
+                r = Path(root).expanduser().resolve()
+            except OSError:
+                return
+            if r not in seen_roots and r.is_dir():
+                seen_roots.add(r)
+                candidate_roots.append(r)
+
+        _add_root(preferred_project_root)
+
+        for cand in [media_resolved.parent] + list(media_resolved.parent.parents):
+            if (cand / ".obol" / "project.toml").is_file():
+                _add_root(cand)
+                break
+
+        for entry in self.hub.list_projects():
+            _add_root(Path(entry.local_path))
+
+        for root in candidate_roots:
+            info = self.find_newer_asset_version(root, media_resolved)
+            if info is not None:
+                return info
+        return None
+
     def find_newer_asset_version(self, project_root: Path, media_file_path: Path) -> Optional[dict[str, Any]]:
         """Inspects a media file path to determine if it belongs to repo/ or published/ and whether a newer version exists."""
         proj_resolved = project_root.resolve()
@@ -1824,6 +1876,7 @@ class ObolWorkspace:
         comp_dir = proj_resolved / matched_comp
         snap = load_component_snapshot(proj_resolved, matched_comp)
         asset_key = "/".join(parts[1:ver_idx]) or "__legacy__"
+        proj_name = self._project_display_name(proj_resolved)
 
         if kind == "repo":
             asset = snap.repo_assets.get(asset_key)
@@ -1856,19 +1909,30 @@ class ObolWorkspace:
                         "file_name": cand.name,
                         "is_latest": v.version == latest_bundle.version,
                         "comment": v.comment,
+                        "created_at": v.created_at,
+                        "size_bytes": int(cand.stat().st_size),
                     })
             up_to_date = latest_bundle.version <= curr_ver
             media_kind = "midi" if media_resolved.suffix.lower() in (".mid", ".midi") else "media"
+            older_vers = [v for v in available_versions if int(v["version"]) < curr_ver]
+            newer_vers = [v for v in available_versions if int(v["version"]) > curr_ver]
             return {
+                "project_root": proj_resolved,
+                "project_name": proj_name,
                 "component": matched_comp,
                 "kind": "repo",
                 "asset_key": asset_key,
                 "current_version": curr_ver,
                 "latest_version": latest_bundle.version,
                 "current_file": media_resolved,
+                "current_exists": media_resolved.is_file(),
                 "latest_file": latest_file,
                 "up_to_date": up_to_date,
                 "update_available": (not up_to_date) and latest_file.is_file() and latest_file != media_resolved,
+                "has_older_versions": bool(older_vers),
+                "has_newer_versions": bool(newer_vers),
+                "prev_version": max(older_vers, key=lambda x: int(x["version"])) if older_vers else None,
+                "next_version": min(newer_vers, key=lambda x: int(x["version"])) if newer_vers else None,
                 "media_kind": media_kind,
                 "available_versions": available_versions,
             }
@@ -1903,20 +1967,31 @@ class ObolWorkspace:
                     "file_name": cand.name,
                     "is_latest": v.version == latest_bundle.version,
                     "comment": v.comment,
+                    "created_at": v.created_at,
+                    "size_bytes": int(cand.stat().st_size),
                 })
         up_to_date = latest_bundle.version <= curr_ver
         latest_file = matched_latest or media_resolved
         media_kind = "midi" if media_resolved.suffix.lower() in (".mid", ".midi") else "media"
+        older_vers = [v for v in available_versions if int(v["version"]) < curr_ver]
+        newer_vers = [v for v in available_versions if int(v["version"]) > curr_ver]
         return {
+            "project_root": proj_resolved,
+            "project_name": proj_name,
             "component": matched_comp,
             "kind": "published",
             "asset_key": asset_key,
             "current_version": curr_ver,
             "latest_version": latest_bundle.version,
             "current_file": media_resolved,
+            "current_exists": media_resolved.is_file(),
             "latest_file": latest_file,
             "up_to_date": up_to_date,
             "update_available": (not up_to_date) and (matched_latest is not None) and (matched_latest != media_resolved),
+            "has_older_versions": bool(older_vers),
+            "has_newer_versions": bool(newer_vers),
+            "prev_version": max(older_vers, key=lambda x: int(x["version"])) if older_vers else None,
+            "next_version": min(newer_vers, key=lambda x: int(x["version"])) if newer_vers else None,
             "media_kind": media_kind,
             "available_versions": available_versions,
         }
@@ -1966,6 +2041,20 @@ class ObolWorkspace:
             mr = Path(meta_root_str).expanduser().resolve()
             if (mr / ".obol" / "project.toml").is_file() and mr not in candidate_roots:
                 candidate_roots.append(mr)
+        fpath_str = str(session_item.get("file_path") or "").strip()
+        if fpath_str:
+            fp_resolved = Path(fpath_str).expanduser().resolve()
+            for cand in [fp_resolved.parent] + list(fp_resolved.parent.parents):
+                if (cand / ".obol" / "project.toml").is_file() and cand not in candidate_roots:
+                    candidate_roots.append(cand)
+                    break
+        for entry in self.hub.list_projects():
+            try:
+                er = Path(entry.local_path).expanduser().resolve()
+            except OSError:
+                continue
+            if (er / ".obol" / "project.toml").is_file() and er not in candidate_roots:
+                candidate_roots.append(er)
         if not candidate_roots:
             return None
 
@@ -1973,7 +2062,6 @@ class ObolWorkspace:
         matched_by = ""
 
         # Tier 1: direct file_path match (audio, video, and file-ref MIDI)
-        fpath_str = str(session_item.get("file_path") or "").strip()
         if fpath_str:
             for root in candidate_roots:
                 info = self.find_newer_asset_version(root, Path(fpath_str))

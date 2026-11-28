@@ -306,6 +306,7 @@ class ShortcutsDialog(QDialog):
         ("Ctrl+I", "Ingest File… (Working / Repo)"),
         ("Ctrl+P", "Publish Deliverable…"),
         ("Ctrl+D", "Open Active Working File in DCC"),
+        ("Ctrl+M", "Open DCC Media Manager…"),
         ("Ctrl+S", "Save Inspector Metadata"),
         ("Ctrl+Shift+C", "Copy Metadata"),
         ("Ctrl+Shift+V", "Paste Metadata"),

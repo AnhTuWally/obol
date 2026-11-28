@@ -426,11 +426,19 @@ class ResolveBridgeClient:
             if bin_path:
                 self._ensure_bin(media_pool, bin_path)
             clips = media_pool.ImportMedia(file_paths) or []
+            asset_metas = params.get("asset_metas") or []
             asset_meta = params.get("asset_meta") or {}
-            if asset_meta and clips:
-                for clip in clips:
+            if clips and (asset_metas or asset_meta):
+                for idx, clip in enumerate(clips):
+                    meta = (
+                        asset_metas[idx]
+                        if idx < len(asset_metas) and isinstance(asset_metas[idx], dict)
+                        else asset_meta
+                    )
+                    if not meta:
+                        continue
                     try:
-                        clip.SetThirdPartyMetadata({f"obol_{k}": str(v) for k, v in asset_meta.items()})
+                        clip.SetThirdPartyMetadata({f"obol_{k}": str(v) for k, v in meta.items()})
                     except Exception:
                         pass
             if params.get("append_to_timeline") and clips:
@@ -449,21 +457,47 @@ class ResolveBridgeClient:
                     fpath = str(clip.GetClipProperty("File Path") or "")
                 except Exception:
                     pass
+                obol_meta: dict[str, Any] = {}
+                try:
+                    if hasattr(clip, "GetThirdPartyMetadata"):
+                        raw_meta = clip.GetThirdPartyMetadata() or {}
+                        if isinstance(raw_meta, dict):
+                            for mk, mv in raw_meta.items():
+                                sk = str(mk)
+                                if sk.startswith("obol_"):
+                                    obol_meta[sk[5:]] = mv
+                except Exception:
+                    obol_meta = {}
                 items.append({
                     "name": str(clip.GetName() or ""),
                     "file_path": fpath.replace("\\", "/"),
                     "bin_path": bpath,
                     "media_id": str(clip.GetMediaId() or "") if hasattr(clip, "GetMediaId") else "",
+                    "obol_meta": obol_meta,
                 })
             return {"items": items}
 
         if action == "replace_media_pool_clips":
             rep_map = {_norm_path_key(k): str(v) for k, v in (params.get("replacements") or {}).items()}
+            by_media_id: dict[str, dict[str, Any]] = {}
+            by_old_path: dict[str, dict[str, Any]] = {}
+            for upd in (params.get("clip_updates") or []):
+                if not isinstance(upd, dict) or not upd.get("target_path"):
+                    continue
+                mid = str(upd.get("media_id") or "").strip()
+                if mid:
+                    by_media_id[mid] = upd
+                old_p = str(upd.get("old_path") or "").strip()
+                if old_p:
+                    by_old_path[_norm_path_key(old_p)] = upd
+
             root = media_pool.GetRootFolder()
             replaced = 0
             for _bpath, clip in self._walk_media_pool_clips(root):
                 fpath = str(clip.GetClipProperty("File Path") or "")
-                target = rep_map.get(_norm_path_key(fpath))
+                media_id = str(clip.GetMediaId() or "") if hasattr(clip, "GetMediaId") else ""
+                upd = (by_media_id.get(media_id) if media_id else None) or by_old_path.get(_norm_path_key(fpath))
+                target = str(upd["target_path"]) if upd else rep_map.get(_norm_path_key(fpath), "")
                 if not target:
                     continue
                 ok = False
@@ -473,6 +507,12 @@ class ResolveBridgeClient:
                     ok = bool(clip.ReplaceClip(target))
                 if ok:
                     replaced += 1
+                    asset_meta = (upd.get("asset_meta") or {}) if upd else {}
+                    if asset_meta and hasattr(clip, "SetThirdPartyMetadata"):
+                        try:
+                            clip.SetThirdPartyMetadata({f"obol_{k}": str(v) for k, v in asset_meta.items()})
+                        except Exception:
+                            pass
             return {"replaced": replaced}
 
         if action == "render_deliver_job":
@@ -554,29 +594,46 @@ class ResolveBridgeClient:
         bin_path: str = "",
         append_to_timeline: bool = False,
         asset_meta: Optional[dict[str, Any]] = None,
+        asset_metas: Optional[list[dict[str, Any]]] = None,
         timeout_s: float = 30.0,
     ) -> dict[str, Any]:
-        return self.send_command(
-            "import_media",
-            {
-                "file_paths": [str(Path(p).resolve()) for p in file_paths],
-                "bin_path": bin_path,
-                "append_to_timeline": bool(append_to_timeline),
-                "asset_meta": asset_meta or {},
-            },
-            timeout_s=timeout_s,
-        )
+        params: dict[str, Any] = {
+            "file_paths": [str(Path(p).resolve()) for p in file_paths],
+            "bin_path": bin_path,
+            "append_to_timeline": bool(append_to_timeline),
+            "asset_meta": asset_meta or {},
+        }
+        if asset_metas is not None:
+            params["asset_metas"] = [dict(m) for m in asset_metas]
+        return self.send_command("import_media", params, timeout_s=timeout_s)
 
     def query_media_pool(self, timeout_s: float = 20.0) -> list[dict[str, Any]]:
         res = self.send_command("query_media_pool", {}, timeout_s=timeout_s)
         items = res.get("items", [])
         return [dict(it) for it in items if isinstance(it, dict)]
 
-    def replace_media_pool_clips(self, replacements: dict[str, str], timeout_s: float = 30.0) -> dict[str, Any]:
-        norm_map = {str(Path(k).resolve()): str(Path(v).resolve()) for k, v in replacements.items()}
+    def replace_media_pool_clips(
+        self,
+        replacements: Optional[dict[str, str]] = None,
+        *,
+        clip_updates: Optional[list[dict[str, Any]]] = None,
+        timeout_s: float = 30.0,
+    ) -> dict[str, Any]:
+        norm_map = {str(Path(k).resolve()): str(Path(v).resolve()) for k, v in (replacements or {}).items()}
+        payload: dict[str, Any] = {"replacements": norm_map}
+        if clip_updates:
+            norm_updates: list[dict[str, Any]] = []
+            for upd in clip_updates:
+                entry = dict(upd)
+                if entry.get("old_path"):
+                    entry["old_path"] = str(Path(str(entry["old_path"])).resolve())
+                if entry.get("target_path"):
+                    entry["target_path"] = str(Path(str(entry["target_path"])).resolve())
+                norm_updates.append(entry)
+            payload["clip_updates"] = norm_updates
         return self.send_command(
             "replace_media_pool_clips",
-            {"replacements": norm_map},
+            payload,
             timeout_s=timeout_s,
         )
 

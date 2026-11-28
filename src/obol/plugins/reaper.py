@@ -160,8 +160,9 @@ class ReaperPlugin:
     @staticmethod
     def find_outdated_rpp_references(
         rpp_file: Path,
-        project_root: Path,
+        project_root: Optional[Path],
         workspace: Any,
+        include_external: bool = False,
     ) -> list[dict[str, Any]]:
         """Scans FILE "..." references in a .rpp file and resolves Obol repo/published version status."""
         results: list[dict[str, Any]] = []
@@ -181,12 +182,32 @@ class ReaperPlugin:
 
             ref_path = Path(raw_ref)
             resolved = (rpp_dir / ref_path).resolve() if not ref_path.is_absolute() else ref_path.resolve()
-            info = workspace.find_newer_asset_version(project_root, resolved)
+            if hasattr(workspace, "resolve_media_file_across_projects"):
+                info = workspace.resolve_media_file_across_projects(resolved, preferred_project_root=project_root)
+            elif project_root is not None:
+                info = workspace.find_newer_asset_version(project_root, resolved)
+            else:
+                info = None
             if info is None:
+                if include_external:
+                    media_kind = "midi" if resolved.suffix.lower() in (".mid", ".midi") else "media"
+                    results.append({
+                        "tracked": False,
+                        "raw_reference": raw_ref,
+                        "resolved_path": resolved,
+                        "current_file": resolved,
+                        "current_exists": resolved.is_file(),
+                        "media_kind": media_kind,
+                        "update_available": False,
+                        "up_to_date": True,
+                        "available_versions": [],
+                    })
                 continue
             entry = dict(info)
+            entry["tracked"] = True
             entry["raw_reference"] = raw_ref
             entry["resolved_path"] = resolved
+            entry.setdefault("current_exists", resolved.is_file())
             results.append(entry)
         return results
 

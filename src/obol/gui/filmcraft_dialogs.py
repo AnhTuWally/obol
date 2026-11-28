@@ -153,26 +153,46 @@ class FilmCraftImportDialog(QDialog):
         tab_upd = QWidget()
         tu_layout = QVBoxLayout(tab_upd)
         tu_top = QHBoxLayout()
-        tu_top.addWidget(QLabel("Scan FilmCraft project clips for newer versions in repo/ or published/:"))
+        tu_top.addWidget(QLabel("Inspect FilmCraft clips, check for updates, and version up or down:"))
         tu_top.addStretch()
+        self.show_external_chk = QCheckBox("Show external / unmanaged")
+        self.show_external_chk.toggled.connect(lambda _c: self.scan_project_updates())
+        tu_top.addWidget(self.show_external_chk)
         self.scan_btn = QPushButton("Scan Project Media")
         self.scan_btn.clicked.connect(self.scan_project_updates)
         tu_top.addWidget(self.scan_btn)
         tu_layout.addLayout(tu_top)
 
-        self.updates_table = QTableWidget(0, 6)
-        self.updates_table.setHorizontalHeaderLabels(["Update", "Bin", "Clip", "Obol Asset", "Current → Latest", "Status"])
+        self.updates_table = QTableWidget(0, 7)
+        self.updates_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.updates_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.updates_table.setHorizontalHeaderLabels(
+            ["Apply", "Bin", "Clip", "Obol Asset", "Loaded", "Status", "Target Version"]
+        )
         self.updates_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.updates_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.updates_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.updates_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         self.updates_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.updates_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.updates_table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         tu_layout.addWidget(self.updates_table, 1)
 
         tu_btns = QHBoxLayout()
+        self.select_outdated_btn = QPushButton("Select Outdated")
+        self.select_outdated_btn.clicked.connect(lambda: self._set_updates_selection(outdated_only=True))
+        self.select_none_btn = QPushButton("Select None")
+        self.select_none_btn.clicked.connect(lambda: self._set_updates_selection(outdated_only=False))
+        self.version_down_btn = QPushButton("Version Down (v-1)")
+        self.version_down_btn.clicked.connect(self._on_version_down_selected)
+        self.set_latest_btn = QPushButton("Set Latest")
+        self.set_latest_btn.clicked.connect(self._on_set_latest_selected)
+        tu_btns.addWidget(self.select_outdated_btn)
+        tu_btns.addWidget(self.select_none_btn)
+        tu_btns.addWidget(self.version_down_btn)
+        tu_btns.addWidget(self.set_latest_btn)
         tu_btns.addStretch()
-        self.apply_updates_btn = QPushButton("Update Selected Media to Latest")
+        self.apply_updates_btn = QPushButton("Apply Version Changes")
         self.apply_updates_btn.setObjectName("PrimaryButton")
         self.apply_updates_btn.clicked.connect(self._on_apply_updates)
         tu_btns.addWidget(self.apply_updates_btn)
@@ -328,14 +348,85 @@ class FilmCraftImportDialog(QDialog):
         except Exception as exc:
             QMessageBox.warning(self, "FilmCraft Import Failed", str(exc))
 
+    def _set_updates_selection(self, outdated_only: bool) -> None:
+        for row in range(self.updates_table.rowCount()):
+            chk = self.updates_table.item(row, 0)
+            if chk is None or not (chk.flags() & Qt.ItemFlag.ItemIsUserCheckable):
+                continue
+            payload = chk.data(Qt.ItemDataRole.UserRole)
+            combo = self.updates_table.cellWidget(row, 6)
+            target_ver = combo.currentData() if isinstance(combo, QComboBox) else None
+            if outdated_only and isinstance(payload, tuple) and len(payload) == 2 and isinstance(target_ver, dict):
+                _item_id, info = payload
+                differs = int(target_ver["version"]) != int(info.get("current_version", 0))
+                chk.setCheckState(Qt.CheckState.Checked if differs else Qt.CheckState.Unchecked)
+            else:
+                chk.setCheckState(Qt.CheckState.Unchecked)
+
+    def _target_rows_for_batch(self) -> list[int]:
+        sel_model = self.updates_table.selectionModel()
+        selected_rows = sorted({idx.row() for idx in sel_model.selectedRows()}) if sel_model else []
+        if not selected_rows:
+            selected_rows = sorted({it.row() for it in self.updates_table.selectedItems()})
+        if selected_rows:
+            return selected_rows
+        checked_rows: list[int] = []
+        tracked_rows: list[int] = []
+        for row in range(self.updates_table.rowCount()):
+            combo = self.updates_table.cellWidget(row, 6)
+            if not isinstance(combo, QComboBox):
+                continue
+            tracked_rows.append(row)
+            chk = self.updates_table.item(row, 0)
+            if chk is not None and chk.checkState() == Qt.CheckState.Checked:
+                checked_rows.append(row)
+        return checked_rows or tracked_rows
+
+    def _on_version_down_selected(self) -> None:
+        for row in self._target_rows_for_batch():
+            combo = self.updates_table.cellWidget(row, 6)
+            if isinstance(combo, QComboBox) and combo.currentIndex() > 0:
+                combo.setCurrentIndex(combo.currentIndex() - 1)
+
+    def _on_set_latest_selected(self) -> None:
+        for row in self._target_rows_for_batch():
+            combo = self.updates_table.cellWidget(row, 6)
+            if isinstance(combo, QComboBox) and combo.count() > 0:
+                combo.setCurrentIndex(combo.count() - 1)
+
+    def _on_target_version_changed(self, row_idx: int) -> None:
+        chk = self.updates_table.item(row_idx, 0)
+        combo = self.updates_table.cellWidget(row_idx, 6)
+        status_it = self.updates_table.item(row_idx, 5)
+        if not chk or not isinstance(combo, QComboBox) or not status_it:
+            return
+        payload = chk.data(Qt.ItemDataRole.UserRole)
+        ver_entry = combo.currentData()
+        if not isinstance(payload, tuple) or len(payload) != 2 or not isinstance(ver_entry, dict):
+            return
+        _item_id, info = payload
+        curr_v = int(info["current_version"])
+        targ_v = int(ver_entry["version"])
+        if targ_v > curr_v:
+            if info.get("update_available") and targ_v == int(info.get("latest_version", targ_v)):
+                status_it.setText("Update Available")
+            else:
+                status_it.setText(f"Upgrade → v{targ_v:03d}")
+            status_it.setForeground(QColor("#fbbf24"))
+            chk.setCheckState(Qt.CheckState.Checked)
+        elif targ_v < curr_v:
+            status_it.setText(f"Version Down → v{targ_v:03d}")
+            status_it.setForeground(QColor("#60a5fa"))
+            chk.setCheckState(Qt.CheckState.Checked)
+        else:
+            status_it.setText("Up to Date")
+            status_it.setForeground(QColor("#4ade80"))
+            chk.setCheckState(Qt.CheckState.Unchecked)
+
     def scan_project_updates(self) -> None:
         self._refresh_bridge_pill()
         raw_root = self.project_combo.currentData()
-        if not raw_root:
-            return
-        proot = Path(str(raw_root))
-        if not proot.is_dir():
-            return
+        proot = Path(str(raw_root)) if raw_root and Path(str(raw_root)).is_dir() else None
         target_path, use_bridge = self._selected_target()
         if target_path is None and use_bridge is not True:
             QMessageBox.warning(self, "Scan Project Media", "Select a working .fcproj file or connect to FilmCraft.")
@@ -346,35 +437,85 @@ class FilmCraftImportDialog(QDialog):
             QMessageBox.warning(self, "Media Scan Failed", str(exc))
             return
 
+        include_external = hasattr(self, "show_external_chk") and self.show_external_chk.isChecked()
         self.updates_table.setRowCount(0)
         for clip in clips:
             fpath_str = str(clip.get("file_path") or "")
             if not fpath_str:
                 continue
-            info = self.workspace.find_newer_asset_version(proot, Path(fpath_str))
+            info = self.workspace.resolve_media_file_across_projects(Path(fpath_str), preferred_project_root=proot)
             if info is None:
+                if not include_external:
+                    continue
+                row_idx = self.updates_table.rowCount()
+                self.updates_table.insertRow(row_idx)
+                chk = QTableWidgetItem()
+                chk.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                exists = Path(fpath_str).is_file() and not bool(clip.get("offline", False))
+                status_it = QTableWidgetItem("External" if exists else "Missing")
+                status_it.setForeground(QColor("#9ca3af") if exists else QColor("#f87171"))
+                self.updates_table.setItem(row_idx, 0, chk)
+                self.updates_table.setItem(row_idx, 1, QTableWidgetItem(str(clip.get("bin_path") or "Root")))
+                self.updates_table.setItem(row_idx, 2, QTableWidgetItem(str(clip.get("name") or Path(fpath_str).name)))
+                self.updates_table.setItem(row_idx, 3, QTableWidgetItem("External (Unmanaged)"))
+                self.updates_table.setItem(row_idx, 4, QTableWidgetItem("—"))
+                self.updates_table.setItem(row_idx, 5, status_it)
+                self.updates_table.setItem(row_idx, 6, QTableWidgetItem("—"))
                 continue
+
             row_idx = self.updates_table.rowCount()
             self.updates_table.insertRow(row_idx)
 
             chk = QTableWidgetItem()
-            chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled)
+            chk.setFlags(Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
             chk.setCheckState(Qt.CheckState.Checked if info["update_available"] else Qt.CheckState.Unchecked)
             chk.setData(Qt.ItemDataRole.UserRole, (int(clip["id"]), info))
 
             bin_it = QTableWidgetItem(str(clip.get("bin_path") or "Root"))
             clip_it = QTableWidgetItem(str(clip.get("name") or Path(fpath_str).name))
             asset_it = QTableWidgetItem(f"{info['component']} / {info['kind']} / {info['asset_key']}")
-            ver_it = QTableWidgetItem(f"v{info['current_version']:03d} → v{info['latest_version']:03d}")
+            loaded_it = QTableWidgetItem(f"v{info['current_version']:03d}")
             status_it = QTableWidgetItem("Update Available" if info["update_available"] else "Up to Date")
             status_it.setForeground(QColor("#fbbf24") if info["update_available"] else QColor("#4ade80"))
+
+            ver_combo = QComboBox()
+            versions = list(info.get("available_versions") or [])
+            if not versions:
+                versions = [
+                    {
+                        "version": int(info["current_version"]),
+                        "version_label": f"v{int(info['current_version']):03d}",
+                        "file_path": info["current_file"],
+                        "file_name": Path(str(info["current_file"])).name,
+                        "is_latest": not info.get("update_available"),
+                    }
+                ]
+                if info.get("update_available"):
+                    versions.append({
+                        "version": int(info["latest_version"]),
+                        "version_label": f"v{int(info['latest_version']):03d}",
+                        "file_path": info["latest_file"],
+                        "file_name": Path(str(info["latest_file"])).name,
+                        "is_latest": True,
+                    })
+
+            default_ver = int(info["latest_version"]) if info.get("update_available") else int(info["current_version"])
+            sel_idx = 0
+            for idx, v in enumerate(versions):
+                lbl = f"{v['version_label']}{' ★' if v.get('is_latest') else ''}"
+                ver_combo.addItem(lbl, v)
+                if int(v["version"]) == default_ver:
+                    sel_idx = idx
+            ver_combo.setCurrentIndex(sel_idx)
+            ver_combo.currentIndexChanged.connect(lambda _idx, r=row_idx: self._on_target_version_changed(r))
 
             self.updates_table.setItem(row_idx, 0, chk)
             self.updates_table.setItem(row_idx, 1, bin_it)
             self.updates_table.setItem(row_idx, 2, clip_it)
             self.updates_table.setItem(row_idx, 3, asset_it)
-            self.updates_table.setItem(row_idx, 4, ver_it)
+            self.updates_table.setItem(row_idx, 4, loaded_it)
             self.updates_table.setItem(row_idx, 5, status_it)
+            self.updates_table.setCellWidget(row_idx, 6, ver_combo)
 
     def _on_apply_updates(self) -> None:
         target_path, use_bridge = self._selected_target()
@@ -383,15 +524,30 @@ class FilmCraftImportDialog(QDialog):
         replacements: dict[int, Path] = {}
         for row in range(self.updates_table.rowCount()):
             chk = self.updates_table.item(row, 0)
-            if chk and chk.checkState() == Qt.CheckState.Checked:
-                payload = chk.data(Qt.ItemDataRole.UserRole)
-                if isinstance(payload, tuple) and len(payload) == 2:
-                    item_id, info = payload
-                    if info and info.get("update_available"):
-                        replacements[int(item_id)] = Path(str(info["latest_file"]))
+            if not chk or chk.checkState() != Qt.CheckState.Checked:
+                continue
+            payload = chk.data(Qt.ItemDataRole.UserRole)
+            if not (isinstance(payload, tuple) and len(payload) == 2):
+                continue
+            item_id, info = payload
+            if not isinstance(info, dict):
+                continue
+            combo = self.updates_table.cellWidget(row, 6)
+            ver_entry = combo.currentData() if isinstance(combo, QComboBox) else None
+            if isinstance(ver_entry, dict):
+                target_file = Path(str(ver_entry["file_path"])).resolve()
+                target_ver = int(ver_entry["version"])
+            else:
+                target_file = Path(str(info["latest_file"])).resolve()
+                target_ver = int(info["latest_version"])
+
+            curr_file = Path(str(info["current_file"])).resolve()
+            if target_ver == int(info["current_version"]) and target_file == curr_file:
+                continue
+            replacements[int(item_id)] = target_file
 
         if not replacements:
-            QMessageBox.information(self, "Project Media Updates", "No outdated clips are checked for update.")
+            QMessageBox.information(self, "Project Media Updates", "No clips with a changed target version are checked.")
             return
         try:
             res = self.bridge.replace_media_items(
@@ -403,7 +559,7 @@ class FilmCraftImportDialog(QDialog):
             QMessageBox.information(
                 self,
                 "Updated Project Media",
-                f"Replaced {res.get('replaced', 0)} clip(s) with latest Obol versions.",
+                f"Replaced {res.get('replaced', 0)} clip(s) in FilmCraft.",
             )
             self.scan_project_updates()
         except Exception as exc:

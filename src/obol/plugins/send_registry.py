@@ -324,10 +324,25 @@ class ResolveSendTarget:
                 offline_hint=True,
             )
         bin_path = f"Obol/{ctx.component_path}" if ctx.component_path else ""
+        metas: list[dict[str, Any]] = []
+        for p in existing:
+            meta = (
+                ctx.workspace.describe_asset_file(ctx.project_root, p)
+                if ctx.project_root
+                else None
+            )
+            if meta is None:
+                meta = {
+                    "file_path": str(p.resolve()),
+                    "file_name": p.name,
+                }
+            metas.append(meta)
         res = self.bridge.import_media(
             existing,
             bin_path=bin_path,
             append_to_timeline=(mode_id == "timeline"),
+            asset_meta=(metas[0] if len(metas) == 1 else {}),
+            asset_metas=metas,
         )
         imported = int(res.get("imported", len(existing)))
         return DCCSendResult(
